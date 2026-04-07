@@ -17,6 +17,8 @@ env/
 build/
 dist/
 *.egg-info/
+pip-wheel-metadata/
+*.whl
 
 # Local app data and secrets
 .env
