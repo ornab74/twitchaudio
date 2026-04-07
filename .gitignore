@@ -7,7 +7,7 @@ __pycache__/
 .ruff_cache/
 .coverage
 htmlcov/
-
+default
 # Virtual environments
 .venv/
 venv/
