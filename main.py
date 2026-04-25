@@ -23,10 +23,10 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 try:
-    from tkinter import BooleanVar, messagebox
+    from tkinter import BooleanVar, PhotoImage, messagebox
 
     import customtkinter as ctk
-    from PIL import Image
+
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 except ModuleNotFoundError as exc:
@@ -1576,6 +1576,12 @@ class TwitchAudioApp(ctk.CTk):
         self.online_statuses: dict[str, bool] = {}
         self.online_refresh_in_progress = False
         self.last_online_refresh = 0.0
+        self.video_restart_attempts = 0
+        self.video_restart_after_id: str | None = None
+        self.video_last_url = ""
+        self.video_last_quality = ""
+        self.video_last_volume = 2.0
+        self.stopping_stream = False
 
         self.title("TwitchAudio Command Deck")
         self.geometry("1180x760")
@@ -1596,27 +1602,23 @@ class TwitchAudioApp(ctk.CTk):
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
 
-        self.logo_image: ctk.CTkImage | None = None
+        self.logo_image: PhotoImage | None = None
         if LOGO_PATH.exists():
             try:
-                raw_logo = Image.open(LOGO_PATH)
-                self.logo_image = ctk.CTkImage(light_image=raw_logo, dark_image=raw_logo, size=(235, 134))
+                raw_logo = PhotoImage(file=str(LOGO_PATH))
+                scale = max(raw_logo.width() // 235, raw_logo.height() // 134, 1)
+                self.logo_image = raw_logo.subsample(scale, scale)
                 ctk.CTkLabel(sidebar, image=self.logo_image, text="").pack(anchor="w", padx=24, pady=(20, 4))
             except Exception as exc:
                 self.log(f"Logo could not be loaded: {exc}")
 
-        ctk.CTkLabel(
-            sidebar,
-            text="TwitchAudio",
-            font=ctk.CTkFont(size=24, weight="bold"),
-            text_color="#f6f8ff",
-        ).pack(anchor="w", padx=26, pady=(6 if self.logo_image else 32, 2))
-        ctk.CTkLabel(
-            sidebar,
-            text="Audio-only command deck",
-            font=ctk.CTkFont(size=13),
-            text_color="#7f8aa6",
-        ).pack(anchor="w", padx=28)
+        if not self.logo_image:
+            ctk.CTkLabel(
+                sidebar,
+                text="TwitchFreedom",
+                font=ctk.CTkFont(size=24, weight="bold"),
+                text_color="#f6f8ff",
+            ).pack(anchor="w", padx=26, pady=(32, 2))
 
         self.status_card = ctk.CTkFrame(sidebar, fg_color="#151a2a", corner_radius=22, border_width=1, border_color="#26334f")
         self.status_card.pack(fill="x", padx=22, pady=(32, 18))
@@ -2185,11 +2187,15 @@ class TwitchAudioApp(ctk.CTk):
             "--no-config",
             f"--wid={window_id}",
             "--cache=yes",
-            "--cache-secs=4",
-            "--demuxer-readahead-secs=4",
+            "--cache-secs=12",
+            "--demuxer-readahead-secs=12",
+            "--demuxer-max-bytes=64MiB",
+            "--demuxer-max-back-bytes=16MiB",
             "--force-window=yes",
             "--vo=x11",
             "--framedrop=vo",
+            "--untimed=no",
+            "--video-sync=audio",
             "--demuxer-lavf-format=mpegts",
             f"--volume={max(0, min(volume * 100, 300)):.0f}",
             "-",
@@ -2220,6 +2226,7 @@ class TwitchAudioApp(ctk.CTk):
         if self.is_streaming:
             self.log("A stream is already running.")
             return False
+        self.video_restart_attempts = 0
 
         selected = self._selected_stream()
         if selected is None:
@@ -2244,20 +2251,7 @@ class TwitchAudioApp(ctk.CTk):
 
         try:
             if video_mode:
-                self.stream_process = subprocess.Popen(
-                    self._streamlink_command(url, quality),
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                if self.stream_process.stdout is None:
-                    raise RuntimeError("streamlink did not provide a video pipe.")
-                self.embedded_video_process = subprocess.Popen(
-                    self._embedded_mpv_command(volume),
-                    stdin=self.stream_process.stdout,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.PIPE,
-                )
-                self.stream_process.stdout.close()
+                self._start_embedded_video_pipe(url, quality, volume)
                 self.video_status_label.configure(text=f"Playing in app: {channel_name_from_url(url)} at {quality}")
             else:
                 self.stream_process = subprocess.Popen(
@@ -2297,6 +2291,40 @@ class TwitchAudioApp(ctk.CTk):
         monitor = threading.Thread(target=self.monitor_stream, args=(url,), daemon=True)
         monitor.start()
         return True
+
+    def _start_embedded_video_pipe(self, url: str, quality: str, volume: float) -> None:
+        self.video_last_url = url
+        self.video_last_quality = quality
+        self.video_last_volume = volume
+        self.stream_process = subprocess.Popen(
+            self._streamlink_command(url, quality),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if self.stream_process.stdout is None:
+            raise RuntimeError("streamlink did not provide a video pipe.")
+        self.embedded_video_process = subprocess.Popen(
+            self._embedded_mpv_command(volume),
+            stdin=self.stream_process.stdout,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        self.stream_process.stdout.close()
+
+    def _cleanup_video_pipe(self) -> None:
+        processes = [self.embedded_video_process, self.stream_process]
+        for process in processes:
+            if process and process.poll() is None:
+                process.terminate()
+        deadline = time.time() + 1.5
+        for process in processes:
+            if process and process.poll() is None:
+                try:
+                    process.wait(timeout=max(deadline - time.time(), 0.1))
+                except subprocess.TimeoutExpired:
+                    process.kill()
+        self.embedded_video_process = None
+        self.stream_process = None
 
     def toggle_video_popout(self) -> None:
         if self.is_video_popped:
@@ -2379,7 +2407,11 @@ class TwitchAudioApp(ctk.CTk):
             time.sleep(1)
 
     def stop_stream(self, user_requested: bool) -> None:
+        self.stopping_stream = True
         self.cancel_volume_restart()
+        if self.video_restart_after_id is not None:
+            self.after_cancel(self.video_restart_after_id)
+            self.video_restart_after_id = None
         processes = [self.play_process, self.stream_process, self.embedded_video_process]
         for process in processes:
             if process and process.poll() is None:
@@ -2405,6 +2437,7 @@ class TwitchAudioApp(ctk.CTk):
         self.stop_button.configure(state="disabled")
         if user_requested:
             self.log("Stopped stream.")
+        self.stopping_stream = False
 
     def monitor_stream(self, url: str) -> None:
         while self.is_streaming:
@@ -2412,6 +2445,8 @@ class TwitchAudioApp(ctk.CTk):
             play_code = self.play_process.poll() if self.play_process else None
             embedded_code = self.embedded_video_process.poll() if self.embedded_video_process else None
             if stream_code is not None or play_code is not None or embedded_code is not None:
+                if self.stopping_stream:
+                    return
                 if self.embedded_video_process and embedded_code is None:
                     time.sleep(0.35)
                     embedded_code = self.embedded_video_process.poll()
@@ -2438,9 +2473,46 @@ class TwitchAudioApp(ctk.CTk):
                     mpv_error = self._process_error_tail(self.embedded_video_process)
                     if mpv_error:
                         details.append(f"mpv: {mpv_error}")
-                self.event_queue.put(("stopped", "\n".join(details)))
+                event = "video_retry" if self.embedded_video_process is not None or embedded_code is not None else "stopped"
+                self.event_queue.put((event, "\n".join(details)))
                 return
             time.sleep(1)
+
+    def retry_embedded_video(self, detail: str) -> None:
+        if not self.is_streaming or self.stopping_stream:
+            return
+        if self.playback_mode_option.get() != PLAYBACK_LOW_VIDEO:
+            self.stop_stream(user_requested=False)
+            self.log(detail)
+            return
+        self.log(detail)
+        if self.video_restart_attempts >= 5:
+            self.video_status_label.configure(text="Video stopped after repeated buffering retries.", text_color="#ffb86c")
+            self.stop_stream(user_requested=False)
+            return
+        self.video_restart_attempts += 1
+        delay_ms = min(1200 + self.video_restart_attempts * 900, 6000)
+        self.video_status_label.configure(
+            text=f"Buffering video... retry {self.video_restart_attempts}/5",
+            text_color="#ffb86c",
+        )
+        self._cleanup_video_pipe()
+        self.video_restart_after_id = self.after(delay_ms, self._restart_embedded_video)
+
+    def _restart_embedded_video(self) -> None:
+        self.video_restart_after_id = None
+        if not self.is_streaming or self.stopping_stream:
+            return
+        try:
+            self._start_embedded_video_pipe(self.video_last_url, self.video_last_quality, self.video_last_volume)
+        except Exception as exc:
+            self.event_queue.put(("video_retry", f"Video retry failed: {exc}"))
+            return
+        self.video_status_label.configure(
+            text=f"Playing in app: {channel_name_from_url(self.video_last_url)} at {self.video_last_quality}",
+            text_color="#a7b0c8",
+        )
+        threading.Thread(target=self.monitor_stream, args=(self.video_last_url,), daemon=True).start()
 
     def process_events(self) -> None:
         try:
@@ -2451,6 +2523,8 @@ class TwitchAudioApp(ctk.CTk):
                     self.log(detail)
                     if "mpv exit" in detail or "streamlink exit" in detail:
                         self.video_status_label.configure(text=detail[:260], text_color="#ffb86c")
+                elif event == "video_retry":
+                    self.retry_embedded_video(detail)
                 elif event == "video_stopped" and self.is_video_popped:
                     self.stop_video_popout(user_requested=False)
                     self.log(detail)
@@ -2573,3 +2647,4 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.exit(0)
+
