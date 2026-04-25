@@ -146,37 +146,26 @@ DIAGNOSTIC_LOG_INTERVAL_SECONDS = 1.5
 VIDEO_READY_MESSAGE = "Video is ready. Choose Video mode and a resolution. FFplay is used for audio and video playback; double-click the in-app video for fullscreen."
 TWITCH_CATEGORY_IDS = {
     "Software and Game Development": "1469308723",
-    "Software & Game Development": "1469308723",
     "Science & Technology": "509670",
-    "Science and Technology": "509670",
-    "Science-and-Technology": "509670",
-    "science-and-technology": "509670",
     "Just Chatting": "509658",
     "Music": "26936",
     "Art": "509660",
     "Makers & Crafting": "509673",
     "Makers and Crafting": "509673",
     "Food & Drink": "509667",
-    "Food and Drink": "509667",
     "Sports": "518203",
     "Talk Shows & Podcasts": "417752",
-    "Talk Shows and Podcasts": "417752",
     "Special Events": "509663",
 }
 TWITCH_CATEGORY_SLUGS = {
-    "Software and Game Development": "software-and-game-development",
     "Software & Game Development": "software-and-game-development",
     "Science & Technology": "science-and-technology",
-    "Science and Technology": "science-and-technology",
-    "Science-and-Technology": "science-and-technology",
-    "science-and-technology": "science-and-technology",
     "Just Chatting": "just-chatting",
     "Music": "music",
     "Art": "art",
     "Makers & Crafting": "makers-and-crafting",
     "Makers and Crafting": "makers-and-crafting",
     "Food & Drink": "food-and-drink",
-    "Food and Drink": "food-and-drink",
     "Sports": "sports",
     "Talk Shows & Podcasts": "talk-shows-and-podcasts",
     "Talk Shows and Podcasts": "talk-shows-and-podcasts",
@@ -701,67 +690,38 @@ def send_x11_key_to_window(window_id: int, key: str = "f") -> bool:
 
 def watch_x11_double_click(window_id: int, on_double_click: Callable[[], None]) -> bool:
     x11 = _load_x11()
-    if x11 is None:
+    if x11 is None or not window_id:
         return False
+
     display = x11.XOpenDisplay(None)
     if not display:
         return False
 
     try:
+        # FFplay is reparented over the Tk video surface, so Tk's double-click
+        # binding will not reliably receive mouse events. Listen directly on the
+        # FFplay X11 window instead of polling pointer state, which can miss fast
+        # clicks.
+        x11.XSelectInput(display, ctypes.c_ulong(window_id), X11_BUTTON_PRESS_MASK)
+        x11.XFlush(display)
+
         last_click_at = 0.0
-        was_down = False
+        last_button = 0
         while True:
-            root_return = ctypes.c_ulong()
-            child_return = ctypes.c_ulong()
-            root_x = ctypes.c_int()
-            root_y = ctypes.c_int()
-            win_x = ctypes.c_int()
-            win_y = ctypes.c_int()
-            mask = ctypes.c_uint()
-            if not x11.XQueryPointer(
-                display,
-                ctypes.c_ulong(window_id),
-                ctypes.byref(root_return),
-                ctypes.byref(child_return),
-                ctypes.byref(root_x),
-                ctypes.byref(root_y),
-                ctypes.byref(win_x),
-                ctypes.byref(win_y),
-                ctypes.byref(mask),
-            ):
-                return False
+            event = XEvent()
+            x11.XNextEvent(display, ctypes.byref(event))
+            if event.type != X11_BUTTON_PRESS:
+                continue
 
-            root = ctypes.c_ulong()
-            geom_x = ctypes.c_int()
-            geom_y = ctypes.c_int()
-            width = ctypes.c_uint()
-            height = ctypes.c_uint()
-            border_width = ctypes.c_uint()
-            depth = ctypes.c_uint()
-            if not x11.XGetGeometry(
-                display,
-                ctypes.c_ulong(window_id),
-                ctypes.byref(root),
-                ctypes.byref(geom_x),
-                ctypes.byref(geom_y),
-                ctypes.byref(width),
-                ctypes.byref(height),
-                ctypes.byref(border_width),
-                ctypes.byref(depth),
-            ):
-                return False
-
-            inside = 0 <= win_x.value < max(int(width.value), 1) and 0 <= win_y.value < max(int(height.value), 1)
-            down = inside and bool(mask.value & 0x1F00)
-            if down and not was_down:
-                now = time.time()
-                if now - last_click_at <= 0.45:
-                    last_click_at = 0.0
-                    on_double_click()
-                else:
-                    last_click_at = now
-            was_down = down
-            time.sleep(0.025)
+            button = int(event.xbutton.button)
+            now = time.time()
+            if button == 1 and last_button == 1 and now - last_click_at <= 0.45:
+                last_click_at = 0.0
+                last_button = 0
+                on_double_click()
+            else:
+                last_click_at = now
+                last_button = button
     except Exception:
         return False
     finally:
@@ -1512,7 +1472,7 @@ class TwitchOAuthManager:
         request = urllib.request.Request(
             url,
             headers={
-                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 TwitchAudio/1.0",
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 TwitchFreedom/1.0",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Referer": "https://www.twitch.tv/",
@@ -3136,8 +3096,15 @@ class TwitchAudioApp(ctk.CTk):
             justify="left",
         )
         self.video_hint_label.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
-        # The separate FFplay Dock button was removed. Video starts from the main Start Video button,
-        # and fullscreen is controlled by double-clicking the video area.
+        self.ffplay_fullscreen_button = ctk.CTkButton(
+            video_panel,
+            text="Fullscreen",
+            height=32,
+            command=self.toggle_ffplay_fullscreen,
+        )
+        self.ffplay_fullscreen_button.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 12))
+        # The separate FFplay Dock button was removed. Video starts from the main Start Video button.
+        # Fullscreen is controlled by double-clicking the video area or pressing this button.
         self.pop_video_button = None
         self.stream_health_label = ctk.CTkLabel(
             video_shell,
@@ -3631,7 +3598,7 @@ class TwitchAudioApp(ctk.CTk):
             self.ffplay_video_fullscreen = False
             self._start_ffplay_double_click_watcher(window_id)
             self.resize_docked_video()
-            self.video_status_label.configure(text="FFplay docked in app. Double-click the video area to toggle FFplay fullscreen.", text_color="#a7b0c8")
+            self.video_status_label.configure(text="FFplay docked in app. Double-click the video area or press Fullscreen to toggle FFplay fullscreen.", text_color="#a7b0c8")
             self.log("Docked ffplay into the video panel.")
 
         self.after(0, finish)
@@ -3661,7 +3628,7 @@ class TwitchAudioApp(ctk.CTk):
             self.ffplay_video_fullscreen = False
             self._start_ffplay_double_click_watcher(window_id)
             self.resize_docked_video()
-            self.video_status_label.configure(text="FFplay docked in app. Double-click the video area to toggle FFplay fullscreen.", text_color="#a7b0c8")
+            self.video_status_label.configure(text="FFplay docked in app. Double-click the video area or press Fullscreen to toggle FFplay fullscreen.", text_color="#a7b0c8")
             self.log("Docked ffplay into the video panel.")
 
         self.after(0, finish)
@@ -3712,7 +3679,7 @@ class TwitchAudioApp(ctk.CTk):
 
         if fullscreen_x11_window(self.docked_video_window_id):
             self.ffplay_video_fullscreen = True
-            self.video_status_label.configure(text="FFplay video is fullscreen. Double-click the video again to return it to the app.", text_color="#a7b0c8")
+            self.video_status_label.configure(text="FFplay video is fullscreen. Double-click the video or press Fullscreen again to return it to the app.", text_color="#a7b0c8")
             self.log("Moved FFplay video window to fullscreen.")
             return
 

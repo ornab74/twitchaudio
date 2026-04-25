@@ -40,3 +40,7 @@ pip-wheel-metadata/
 .DS_Store
 Thumbs.db
 default.profraw
+icons/twitchfreedom.png
+.gitignore
+twitchfreedom.desktop
+twitchfreedom.sh
