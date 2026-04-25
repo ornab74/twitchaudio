@@ -136,6 +136,7 @@ STREAMLINK_SEGMENT_THREADS = "4"
 CHAT_SOCKET_TIMEOUT_SECONDS = 2.0
 ONLINE_STATUS_REFRESH_SECONDS = 300
 EXPLORE_CACHE_SECONDS = 120
+EXPLORE_PAGE_SIZE = 25
 EVENT_POLL_IDLE_MS = 2000
 EVENT_POLL_ACTIVE_MS = 250
 MAX_EVENTS_PER_TICK = 80
@@ -1628,8 +1629,11 @@ class TwitchOAuthManager:
                 break
         return unique
 
-    def _streams_for_category_id(self, category_id: str, limit: int) -> list[dict[str, str]]:
-        payload = self.helix_get("/streams", [("game_id", category_id), ("first", str(max(1, min(limit, 100))))])
+    def _streams_for_category_id_page(self, category_id: str, limit: int, cursor: str | None = None) -> tuple[list[dict[str, str]], str]:
+        params = [("game_id", category_id), ("first", str(max(1, min(limit, 100))))]
+        if cursor:
+            params.append(("after", cursor))
+        payload = self.helix_get("/streams", params)
         streams: list[dict[str, str]] = []
         for item in payload.get("data", []):
             if not isinstance(item, dict):
@@ -1637,7 +1641,44 @@ class TwitchOAuthManager:
             record = self._stream_record_from_parts(item.get("user_login"), item.get("user_name"), item.get("title"))
             if record:
                 streams.append(record)
+        pagination = payload.get("pagination") if isinstance(payload.get("pagination"), dict) else {}
+        next_cursor = str(pagination.get("cursor") or "")
+        return streams, next_cursor
+
+    def _streams_for_category_id(self, category_id: str, limit: int) -> list[dict[str, str]]:
+        streams, _next_cursor = self._streams_for_category_id_page(category_id, limit)
         return streams
+
+    def _streams_from_top_live_matching_page(
+        self,
+        category_aliases: list[str],
+        limit: int,
+        cursor: str | None = None,
+    ) -> tuple[list[dict[str, str]], str]:
+        params = [("first", "100")]
+        if cursor:
+            params.append(("after", cursor))
+        payload = self.helix_get("/streams", params)
+        normalized_aliases = {
+            sanitize_text(alias, max_chars=100).lower().replace("&", "and").replace("-", " ")
+            for alias in category_aliases
+            if sanitize_text(alias, max_chars=100)
+        }
+        streams: list[dict[str, str]] = []
+        for item in payload.get("data", []):
+            if not isinstance(item, dict):
+                continue
+            game_name = sanitize_text(item.get("game_name"), max_chars=100).lower().replace("&", "and").replace("-", " ")
+            if game_name not in normalized_aliases:
+                continue
+            record = self._stream_record_from_parts(item.get("user_login"), item.get("user_name"), item.get("title"))
+            if record:
+                streams.append(record)
+                if len(streams) >= max(1, min(limit, 100)):
+                    break
+        pagination = payload.get("pagination") if isinstance(payload.get("pagination"), dict) else {}
+        next_cursor = str(pagination.get("cursor") or "")
+        return self._dedupe_streams(streams, limit), next_cursor
 
     def _search_live_channels(self, queries: list[str], limit: int, category_aliases: list[str]) -> list[dict[str, str]]:
         exact_matches: list[dict[str, str]] = []
@@ -1806,31 +1847,75 @@ class TwitchOAuthManager:
                 fallback_streams.append(record)
         return self._dedupe_streams(fallback_streams, limit)
 
-    def get_category_streams(self, category: str, limit: int = 30) -> list[dict[str, str]]:
+    def _decode_explore_cursor(self, cursor: str | None) -> tuple[str, str, str]:
+        if not cursor:
+            return "", "", ""
+        parts = str(cursor).split(":", 2)
+        if len(parts) != 3:
+            return "", "", ""
+        return parts[0], parts[1], parts[2]
+
+    def get_category_streams_page(self, category: str, limit: int = 30, cursor: str | None = None) -> dict[str, Any]:
         clean_category = sanitize_text(category, max_chars=80)
         category_aliases = self._category_query_aliases(clean_category)
-        all_streams: list[dict[str, str]] = []
-        for category_id in self._category_id_candidates(clean_category):
-            all_streams.extend(self._streams_for_category_id(category_id, limit))
-        streams = self._dedupe_streams(all_streams, limit)
+        cursor_kind, cursor_key, cursor_value = self._decode_explore_cursor(cursor)
+
+        if cursor_kind == "helix" and cursor_key:
+            streams, next_cursor = self._streams_for_category_id_page(cursor_key, limit, cursor_value)
+            return {
+                "streams": self._dedupe_streams(streams, limit),
+                "next_cursor": f"helix:{cursor_key}:{next_cursor}" if next_cursor else "",
+                "source": f"Helix category {cursor_key}",
+            }
+
+        if cursor_kind == "toplive":
+            streams, next_cursor = self._streams_from_top_live_matching_page(category_aliases, limit, cursor_value)
+            return {
+                "streams": streams,
+                "next_cursor": f"toplive:all:{next_cursor}" if next_cursor else "",
+                "source": "top live category filter",
+            }
+
+        category_ids = self._category_id_candidates(clean_category)
+        for category_id in category_ids:
+            streams, next_cursor = self._streams_for_category_id_page(category_id, limit)
+            streams = self._dedupe_streams(streams, limit)
+            if streams:
+                return {
+                    "streams": streams,
+                    "next_cursor": f"helix:{category_id}:{next_cursor}" if next_cursor else "",
+                    "source": f"Helix category {category_id}",
+                }
+
+        streams, next_cursor = self._streams_from_top_live_matching_page(category_aliases, limit)
         if streams:
-            return streams
+            return {
+                "streams": streams,
+                "next_cursor": f"toplive:all:{next_cursor}" if next_cursor else "",
+                "source": "top live category filter",
+            }
 
         for slug in self._category_slug_candidates(clean_category):
             streams = self._streams_from_twitch_graphql_category(clean_category, slug, limit)
             if streams:
-                return streams
+                return {"streams": streams, "next_cursor": "", "source": f"Twitch directory GraphQL {slug}"}
 
         for slug in self._category_slug_candidates(clean_category):
             streams = self._streams_from_directory_slug(slug, limit)
             if streams:
-                return streams
+                return {"streams": streams, "next_cursor": "", "source": f"Twitch directory page {slug}"}
 
         fallback_queries = list(category_aliases)
         normalized_category = clean_category.lower().replace("&", "and").replace("-", " ")
         if normalized_category == "science and technology" or "science-and-technology" in category_aliases:
             fallback_queries.extend(SCIENCE_TECH_FALLBACK_QUERIES)
-        return self._search_live_channels(fallback_queries, limit, category_aliases)
+        streams = self._search_live_channels(fallback_queries, limit, category_aliases)
+        return {"streams": streams, "next_cursor": "", "source": "live channel search"}
+
+    def get_category_streams(self, category: str, limit: int = 30) -> list[dict[str, str]]:
+        page = self.get_category_streams_page(category, limit)
+        streams = page.get("streams", [])
+        return streams if isinstance(streams, list) else []
 
     def get_top_categories(self, limit: int = 60) -> list[str]:
         payload = self.helix_get("/games/top", [("first", str(max(1, min(limit, 100))))])
@@ -2351,6 +2436,9 @@ class ExploreWindow(ctk.CTkToplevel):
         self.category_buttons: dict[str, ctk.CTkButton] = {}
         self.stream_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
         self.active_category = ""
+        self.page_index = 0
+        self.loaded_pages: list[dict[str, Any]] = []
+        self.loading_page = False
         self.title("Explore Twitch")
         self.geometry("980x700")
         self.minsize(820, 560)
@@ -2397,6 +2485,7 @@ class ExploreWindow(ctk.CTkToplevel):
         content.grid(row=0, column=1, sticky="nsew")
         content.grid_columnconfigure(0, weight=1)
         content.grid_rowconfigure(2, weight=1)
+        content.grid_rowconfigure(3, weight=0)
         self.category_title = ctk.CTkLabel(
             content,
             text="Loading categories...",
@@ -2414,7 +2503,37 @@ class ExploreWindow(ctk.CTkToplevel):
         )
         self.category_subtitle.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 10))
         self.stream_frame = ctk.CTkScrollableFrame(content, fg_color="transparent")
-        self.stream_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self.stream_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 8))
+
+        self.page_nav = ctk.CTkFrame(content, fg_color="transparent")
+        self.page_nav.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 12))
+        self.prev_page_button = ctk.CTkButton(
+            self.page_nav,
+            text="Previous",
+            width=96,
+            fg_color="#26304a",
+            hover_color="#34405f",
+            state="disabled",
+            command=self._previous_page,
+        )
+        self.prev_page_button.pack(side="left")
+        self.page_label = ctk.CTkLabel(
+            self.page_nav,
+            text="Page 1",
+            text_color="#8b96b3",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self.page_label.pack(side="left", padx=14)
+        self.next_page_button = ctk.CTkButton(
+            self.page_nav,
+            text="Next",
+            width=96,
+            fg_color="#26304a",
+            hover_color="#34405f",
+            state="disabled",
+            command=self._next_page,
+        )
+        self.next_page_button.pack(side="left")
 
         self._render_categories(list(self.PINNED_CATEGORIES))
         self.select_category(self.PINNED_CATEGORIES[0])
@@ -2453,6 +2572,9 @@ class ExploreWindow(ctk.CTkToplevel):
 
     def select_category(self, category: str) -> None:
         self.active_category = category
+        self.page_index = 0
+        self.loaded_pages = []
+        self.loading_page = False
         for name, button in self.category_buttons.items():
             button.configure(
                 fg_color="#151a2a" if name == category else "transparent",
@@ -2460,12 +2582,9 @@ class ExploreWindow(ctk.CTkToplevel):
             )
         self.category_title.configure(text=category)
         self.category_subtitle.configure(text="Live now, sorted by Twitch. No viewer counts shown.")
-        cached = self.stream_cache.get(category)
-        if cached and time.time() - cached[0] < EXPLORE_CACHE_SECONDS:
-            self._render_category(category, cached[1])
-            return
         self._set_stream_message("Loading live streams...")
-        threading.Thread(target=self._load_category, args=(category,), daemon=True).start()
+        self._update_page_controls()
+        threading.Thread(target=self._load_category_page, args=(category, 0, None), daemon=True).start()
 
     def _set_stream_message(self, message: str) -> None:
         for child in self.stream_frame.winfo_children():
@@ -2479,24 +2598,85 @@ class ExploreWindow(ctk.CTkToplevel):
             justify="left",
         ).pack(anchor="w", padx=10, pady=10)
 
-    def _load_category(self, category: str) -> None:
+    def _load_category_page(self, category: str, page_index: int, cursor: str | None) -> None:
+        self.loading_page = True
         try:
-            streams = self.oauth.get_category_streams(category, limit=50)
+            result = self.oauth.get_category_streams_page(category, limit=EXPLORE_PAGE_SIZE, cursor=cursor)
         except Exception as exc:
             self.after(0, lambda: self._set_stream_message(f"Could not load streams: {exc}"))
+            self.after(0, self._update_page_controls)
+            self.loading_page = False
             return
-        self.stream_cache[category] = (time.time(), streams)
-        self.after(0, lambda: self._render_category(category, streams))
+        self.after(0, lambda: self._store_and_render_page(category, page_index, result))
+
+    def _store_and_render_page(self, category: str, page_index: int, result: dict[str, Any]) -> None:
+        self.loading_page = False
+        if category != self.active_category:
+            return
+        while len(self.loaded_pages) <= page_index:
+            self.loaded_pages.append({"streams": [], "next_cursor": "", "source": ""})
+        self.loaded_pages[page_index] = result
+        self.page_index = page_index
+        streams = result.get("streams", [])
+        self._render_category(category, streams if isinstance(streams, list) else [])
+
+    def _current_page(self) -> dict[str, Any]:
+        if 0 <= self.page_index < len(self.loaded_pages):
+            return self.loaded_pages[self.page_index]
+        return {"streams": [], "next_cursor": "", "source": ""}
+
+    def _next_page(self) -> None:
+        if self.loading_page:
+            return
+        next_index = self.page_index + 1
+        if next_index < len(self.loaded_pages):
+            page = self.loaded_pages[next_index]
+            self.page_index = next_index
+            streams = page.get("streams", [])
+            self._render_category(self.active_category, streams if isinstance(streams, list) else [])
+            return
+        next_cursor = str(self._current_page().get("next_cursor") or "")
+        if not next_cursor:
+            return
+        self._set_stream_message("Loading next page...")
+        self._update_page_controls()
+        threading.Thread(target=self._load_category_page, args=(self.active_category, next_index, next_cursor), daemon=True).start()
+
+    def _previous_page(self) -> None:
+        if self.loading_page or self.page_index <= 0:
+            return
+        self.page_index -= 1
+        page = self._current_page()
+        streams = page.get("streams", [])
+        self._render_category(self.active_category, streams if isinstance(streams, list) else [])
+
+    def _update_page_controls(self) -> None:
+        current = self._current_page()
+        next_cursor = str(current.get("next_cursor") or "")
+        self.page_label.configure(text=f"Page {self.page_index + 1}")
+        self.prev_page_button.configure(state="normal" if self.page_index > 0 and not self.loading_page else "disabled")
+        has_loaded_next = self.page_index + 1 < len(self.loaded_pages)
+        can_go_next = bool(next_cursor) or has_loaded_next
+        self.next_page_button.configure(state="normal" if can_go_next and not self.loading_page else "disabled")
 
     def _render_category(self, category: str, streams: list[dict[str, str]]) -> None:
         if category != self.active_category:
             return
         for child in self.stream_frame.winfo_children():
             child.destroy()
+        page = self._current_page()
+        source = str(page.get("source") or "Twitch")
+        self.category_subtitle.configure(text=f"Live now, sorted by Twitch. Page {self.page_index + 1}. Source: {source}.")
+        self._update_page_controls()
         if not streams:
-            self._set_stream_message("No live streams found for this category.")
+            self._set_stream_message(
+                "No live streams found for this category. Try clicking the category again to bypass any old cache; "
+                "if it still happens, Twitch returned an empty category/API result for this account or region."
+            )
+            self._update_page_controls()
             return
-        for index, stream in enumerate(streams, start=1):
+        start_rank = self.page_index * EXPLORE_PAGE_SIZE
+        for index, stream in enumerate(streams, start=start_rank + 1):
             card = ctk.CTkFrame(self.stream_frame, fg_color="#151a2a", corner_radius=10, border_width=1, border_color="#26334f")
             card.pack(fill="x", padx=4, pady=6)
             card.grid_columnconfigure(1, weight=1)
