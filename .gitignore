@@ -39,3 +39,4 @@ pip-wheel-metadata/
 # OS files
 .DS_Store
 Thumbs.db
+default.profraw

@@ -1,4 +1,7 @@
 import base64
+import binascii
+import ctypes
+import ctypes.util
 import json
 import os
 import queue
@@ -28,6 +31,7 @@ try:
     import customtkinter as ctk
 
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.exceptions import InvalidTag
     from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 except ModuleNotFoundError as exc:
     missing = exc.name or "a required package"
@@ -95,6 +99,38 @@ PLAYBACK_QUALITIES = (QUALITY_AUDIO_ONLY, *LOW_VIDEO_QUALITIES)
 MAX_CHAT_LINES = 400
 MAX_CHAT_MESSAGE_CHARS = 500
 MAX_CHAT_USER_CHARS = 32
+CHAT_TRIM_INTERVAL = 25
+CHAT_UI_TRIM_BATCH = 50
+CHAT_SAVE_BATCH_MS = 1000
+VIDEO_RETRY_LIMIT = 60
+VIDEO_RETRY_BASE_MS = 800
+VIDEO_RETRY_MAX_MS = 12000
+VIDEO_CACHE_SECONDS = 90
+STREAMLINK_RINGBUFFER_SIZE = "256M"
+STREAMLINK_SEGMENT_THREADS = "4"
+CHAT_SOCKET_TIMEOUT_SECONDS = 2.0
+ONLINE_STATUS_REFRESH_SECONDS = 300
+EXPLORE_CACHE_SECONDS = 120
+EVENT_POLL_IDLE_MS = 2000
+EVENT_POLL_ACTIVE_MS = 250
+MAX_EVENTS_PER_TICK = 80
+PROCESS_MONITOR_INTERVAL_SECONDS = 3.0
+PROCESS_HEARTBEAT_SECONDS = 30.0
+DIAGNOSTIC_LOG_INTERVAL_SECONDS = 1.5
+VIDEO_READY_MESSAGE = "Video is ready. Choose Video mode and a resolution. Use Player Window for lower CPU, or double-click the in-app video for fullscreen."
+TWITCH_CATEGORY_IDS = {
+    "Software and Game Development": "1469308723",
+    "Science & Technology": "509670",
+    "Science and Technology": "509670",
+    "Just Chatting": "509658",
+    "Music": "26936",
+    "Art": "509660",
+    "Makers & Crafting": "509673",
+    "Food & Drink": "509667",
+    "Sports": "518203",
+    "Talk Shows & Podcasts": "417752",
+    "Special Events": "509663",
+}
 
 
 def sanitize_text(value: Any, max_chars: int = 500) -> str:
@@ -245,6 +281,7 @@ class EncryptedHistoryStore:
         self.path = path
         self.connection: sqlite3.Connection | None = None
         self.aes_key: bytes | None = None
+        self.chat_trim_counts: dict[str, int] = {}
 
     @property
     def is_new(self) -> bool:
@@ -276,7 +313,7 @@ class EncryptedHistoryStore:
             verifier_blob = base64.b64decode(verifier.encode("ascii"))
             if self._decrypt_bytes(verifier_blob, b"meta:verifier") != VERIFY_TEXT:
                 raise ValueError
-        except (ValueError, TypeError, KeyError) as exc:
+        except (ValueError, TypeError, KeyError, binascii.Error) as exc:
             self.close()
             raise ValueError("That password could not unlock this history vault.") from exc
 
@@ -371,7 +408,10 @@ class EncryptedHistoryStore:
             raise ValueError("Encrypted payload is not an AES-GCM envelope.")
         nonce = payload[4:16]
         encrypted = payload[16:]
-        return AESGCM(self.aes_key).decrypt(nonce, encrypted, aad)
+        try:
+            return AESGCM(self.aes_key).decrypt(nonce, encrypted, aad)
+        except InvalidTag as exc:
+            raise ValueError("Encrypted payload could not be authenticated.") from exc
 
     def list_streams(self) -> list[StreamRecord]:
         assert self.connection is not None
@@ -481,24 +521,34 @@ class EncryptedHistoryStore:
         self.connection.commit()
 
     def save_chat_message(self, channel: str, user: str, message: str, direction: str) -> None:
+        self.save_chat_messages([(channel, user, message, direction)])
+
+    def save_chat_messages(self, messages: list[tuple[str, str, str, str]]) -> None:
         assert self.connection is not None
-        clean_channel = sanitize_chat_user(channel.lower())
-        if clean_channel == "unknown":
-            return
-        clean_direction = "out" if direction == "out" else "in"
-        payload = {
-            "user": sanitize_chat_user(user),
-            "message": sanitize_chat_message(message),
-            "direction": clean_direction,
-        }
-        self.connection.execute(
-            """
-            INSERT INTO chat_messages (channel, payload, created_at)
-            VALUES (?, ?, ?)
-            """,
-            (clean_channel, self._encrypt_payload(payload), utc_now()),
-        )
-        self._trim_chat_messages(clean_channel)
+        touched_channels: set[str] = set()
+        for channel, user, message, direction in messages:
+            clean_channel = sanitize_chat_user(channel.lower())
+            if clean_channel == "unknown":
+                continue
+            clean_direction = "out" if direction == "out" else "in"
+            payload = {
+                "user": sanitize_chat_user(user),
+                "message": sanitize_chat_message(message),
+                "direction": clean_direction,
+            }
+            self.connection.execute(
+                """
+                INSERT INTO chat_messages (channel, payload, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (clean_channel, self._encrypt_payload(payload), utc_now()),
+            )
+            self.chat_trim_counts[clean_channel] = self.chat_trim_counts.get(clean_channel, 0) + 1
+            touched_channels.add(clean_channel)
+        for channel in touched_channels:
+            if self.chat_trim_counts.get(channel, 0) >= CHAT_TRIM_INTERVAL:
+                self.chat_trim_counts[channel] = 0
+                self._trim_chat_messages(channel)
         self.connection.commit()
 
     def list_chat_messages(self, channel: str, limit: int = 80) -> list[ChatRecord]:
@@ -637,18 +687,20 @@ class EncryptedHistoryStore:
 
     def _trim_chat_messages(self, channel: str) -> None:
         assert self.connection is not None
-        stale_ids = self.connection.execute(
+        self.connection.execute(
             """
-            SELECT id
-            FROM chat_messages
+            DELETE FROM chat_messages
             WHERE channel = ?
-            ORDER BY created_at DESC, id DESC
-            LIMIT -1 OFFSET ?
+              AND id NOT IN (
+                  SELECT id
+                  FROM chat_messages
+                  WHERE channel = ?
+                  ORDER BY created_at DESC, id DESC
+                  LIMIT ?
+              )
             """,
-            (channel, MAX_CHAT_LINES),
-        ).fetchall()
-        for row in stale_ids:
-            self.connection.execute("DELETE FROM chat_messages WHERE id = ?", (row["id"],))
+            (channel, channel, MAX_CHAT_LINES),
+        )
 
 
 class TwitchOAuthManager:
@@ -833,20 +885,31 @@ class TwitchOAuthManager:
 
     def get_category_streams(self, category: str, limit: int = 30) -> list[dict[str, str]]:
         category = sanitize_text(category, max_chars=80)
-        query = "Science & Technology" if category.lower() == "science and technology" else category
-        search = self.helix_get("/search/categories", [("query", query), ("first", "10")])
         category_id = ""
-        for item in search.get("data", []):
+        games = self.helix_get("/games", [("name", category)])
+        for item in games.get("data", []):
             if not isinstance(item, dict):
                 continue
             name = sanitize_text(item.get("name"), max_chars=80)
-            if name.lower() in {category.lower(), query.lower()}:
+            if name.lower() == category.lower():
                 category_id = str(item.get("id") or "")
                 break
-        if not category_id and search.get("data"):
-            first = search["data"][0]
-            if isinstance(first, dict):
-                category_id = str(first.get("id") or "")
+        if not category_id:
+            category_id = TWITCH_CATEGORY_IDS.get(category, "")
+        if not category_id:
+            query = "Science & Technology" if category.lower() == "science and technology" else category
+            search = self.helix_get("/search/categories", [("query", query), ("first", "10")])
+            for item in search.get("data", []):
+                if not isinstance(item, dict):
+                    continue
+                name = sanitize_text(item.get("name"), max_chars=80)
+                if name.lower() in {category.lower(), query.lower()}:
+                    category_id = str(item.get("id") or "")
+                    break
+            if not category_id and search.get("data"):
+                first = search["data"][0]
+                if isinstance(first, dict):
+                    category_id = str(first.get("id") or "")
         if not category_id:
             return []
 
@@ -868,6 +931,17 @@ class TwitchOAuthManager:
                     }
                 )
         return streams
+
+    def get_top_categories(self, limit: int = 60) -> list[str]:
+        payload = self.helix_get("/games/top", [("first", str(max(1, min(limit, 100))))])
+        categories: list[str] = []
+        for item in payload.get("data", []):
+            if not isinstance(item, dict):
+                continue
+            name = sanitize_text(item.get("name"), max_chars=80)
+            if name and name not in categories:
+                categories.append(name)
+        return categories
 
     def _save_token_payload(self, token_payload: dict[str, Any]) -> dict[str, Any]:
         state = self.get_state()
@@ -1357,96 +1431,215 @@ class StreamCard(ctk.CTkFrame):
 
 
 class ExploreWindow(ctk.CTkToplevel):
-    CATEGORIES = ("Software and Game Development", "Science and Technology")
+    PINNED_CATEGORIES = (
+        "Software and Game Development",
+        "Science & Technology",
+        "Just Chatting",
+        "Music",
+        "Art",
+        "Makers & Crafting",
+        "Food & Drink",
+        "Sports",
+        "Talk Shows & Podcasts",
+        "Special Events",
+    )
 
     def __init__(self, master: "TwitchAudioApp", oauth: TwitchOAuthManager) -> None:
         super().__init__(master)
         self.app = master
         self.oauth = oauth
+        self.category_buttons: dict[str, ctk.CTkButton] = {}
+        self.stream_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
+        self.active_category = ""
         self.title("Explore Twitch")
-        self.geometry("760x640")
+        self.geometry("980x700")
+        self.minsize(820, 560)
         self.configure(fg_color="#090b13")
 
         shell = ctk.CTkFrame(self, fg_color="#121625", corner_radius=18, border_width=1, border_color="#24304a")
         shell.pack(fill="both", expand=True, padx=18, pady=18)
+        shell.grid_columnconfigure(1, weight=1)
+        shell.grid_rowconfigure(2, weight=1)
+
         ctk.CTkLabel(
             shell,
             text="Explore",
             font=ctk.CTkFont(size=26, weight="bold"),
             text_color="#f6f8ff",
-        ).pack(anchor="w", padx=18, pady=(18, 10))
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=18, pady=(18, 2))
+        ctk.CTkLabel(
+            shell,
+            text="Live Twitch categories sorted by Twitch. Viewer counts stay hidden.",
+            font=ctk.CTkFont(size=12),
+            text_color="#8b96b3",
+        ).grid(row=1, column=0, columnspan=2, sticky="nw", padx=18, pady=(0, 0))
 
-        self.tabs = ctk.CTkTabview(shell, fg_color="#080a12", segmented_button_fg_color="#151a2a")
-        self.tabs.pack(fill="both", expand=True, padx=18, pady=(0, 18))
-        self.frames: dict[str, ctk.CTkScrollableFrame] = {}
-        for category in self.CATEGORIES:
-            tab = self.tabs.add(category)
-            tab.grid_columnconfigure(0, weight=1)
-            frame = ctk.CTkScrollableFrame(tab, fg_color="transparent")
-            frame.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
-            tab.grid_rowconfigure(0, weight=1)
-            self.frames[category] = frame
-            self._set_loading(category, "Loading live streams...")
-            threading.Thread(target=self._load_category, args=(category,), daemon=True).start()
+        body = ctk.CTkFrame(shell, fg_color="transparent")
+        body.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=18, pady=(16, 18))
+        body.grid_columnconfigure(1, weight=1)
+        body.grid_rowconfigure(0, weight=1)
 
-    def _set_loading(self, category: str, message: str) -> None:
-        frame = self.frames[category]
-        for child in frame.winfo_children():
-            child.destroy()
-        ctk.CTkLabel(frame, text=message, text_color="#a7b0c8", font=ctk.CTkFont(size=13)).pack(
-            anchor="w", padx=10, pady=10
+        rail = ctk.CTkFrame(body, width=245, fg_color="#0d111f", corner_radius=14, border_width=1, border_color="#24304a")
+        rail.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+        rail.grid_propagate(False)
+        rail.grid_columnconfigure(0, weight=1)
+        rail.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(
+            rail,
+            text="Categories",
+            font=ctk.CTkFont(size=16, weight="bold"),
+            text_color="#f6f8ff",
+        ).grid(row=0, column=0, sticky="w", padx=14, pady=(14, 8))
+        self.category_frame = ctk.CTkScrollableFrame(rail, fg_color="transparent")
+        self.category_frame.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 10))
+
+        content = ctk.CTkFrame(body, fg_color="#080a12", corner_radius=14, border_width=1, border_color="#24304a")
+        content.grid(row=0, column=1, sticky="nsew")
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_rowconfigure(2, weight=1)
+        self.category_title = ctk.CTkLabel(
+            content,
+            text="Loading categories...",
+            font=ctk.CTkFont(size=22, weight="bold"),
+            text_color="#f6f8ff",
+            anchor="w",
         )
+        self.category_title.grid(row=0, column=0, sticky="ew", padx=18, pady=(18, 2))
+        self.category_subtitle = ctk.CTkLabel(
+            content,
+            text="",
+            font=ctk.CTkFont(size=12),
+            text_color="#8b96b3",
+            anchor="w",
+        )
+        self.category_subtitle.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 10))
+        self.stream_frame = ctk.CTkScrollableFrame(content, fg_color="transparent")
+        self.stream_frame.grid(row=2, column=0, sticky="nsew", padx=12, pady=(0, 12))
+
+        self._render_categories(list(self.PINNED_CATEGORIES))
+        self.select_category(self.PINNED_CATEGORIES[0])
+        threading.Thread(target=self._load_top_categories, daemon=True).start()
+
+    def _load_top_categories(self) -> None:
+        try:
+            top_categories = self.oauth.get_top_categories()
+        except Exception as exc:
+            self.after(0, lambda: self._set_stream_message(f"Could not load Twitch categories: {exc}"))
+            return
+        combined: list[str] = []
+        for category in [*self.PINNED_CATEGORIES, *top_categories]:
+            normalized = category.strip()
+            if normalized and normalized not in combined:
+                combined.append(normalized)
+        self.after(0, lambda: self._render_categories(combined))
+
+    def _render_categories(self, categories: list[str]) -> None:
+        for child in self.category_frame.winfo_children():
+            child.destroy()
+        self.category_buttons = {}
+        for category in categories:
+            button = ctk.CTkButton(
+                self.category_frame,
+                text=category,
+                height=34,
+                anchor="w",
+                fg_color="#151a2a" if category == self.active_category else "transparent",
+                hover_color="#26304a",
+                text_color="#f6f8ff" if category == self.active_category else "#a7b0c8",
+                command=lambda selected=category: self.select_category(selected),
+            )
+            button.pack(fill="x", padx=4, pady=3)
+            self.category_buttons[category] = button
+
+    def select_category(self, category: str) -> None:
+        self.active_category = category
+        for name, button in self.category_buttons.items():
+            button.configure(
+                fg_color="#151a2a" if name == category else "transparent",
+                text_color="#f6f8ff" if name == category else "#a7b0c8",
+            )
+        self.category_title.configure(text=category)
+        self.category_subtitle.configure(text="Live now, sorted by Twitch. No viewer counts shown.")
+        cached = self.stream_cache.get(category)
+        if cached and time.time() - cached[0] < EXPLORE_CACHE_SECONDS:
+            self._render_category(category, cached[1])
+            return
+        self._set_stream_message("Loading live streams...")
+        threading.Thread(target=self._load_category, args=(category,), daemon=True).start()
+
+    def _set_stream_message(self, message: str) -> None:
+        for child in self.stream_frame.winfo_children():
+            child.destroy()
+        ctk.CTkLabel(
+            self.stream_frame,
+            text=message,
+            text_color="#a7b0c8",
+            font=ctk.CTkFont(size=13),
+            wraplength=600,
+            justify="left",
+        ).pack(anchor="w", padx=10, pady=10)
 
     def _load_category(self, category: str) -> None:
         try:
-            streams = self.oauth.get_category_streams(category)
+            streams = self.oauth.get_category_streams(category, limit=50)
         except Exception as exc:
-            self.after(0, lambda: self._set_loading(category, f"Could not load streams: {exc}"))
+            self.after(0, lambda: self._set_stream_message(f"Could not load streams: {exc}"))
             return
+        self.stream_cache[category] = (time.time(), streams)
         self.after(0, lambda: self._render_category(category, streams))
 
     def _render_category(self, category: str, streams: list[dict[str, str]]) -> None:
-        frame = self.frames[category]
-        for child in frame.winfo_children():
+        if category != self.active_category:
+            return
+        for child in self.stream_frame.winfo_children():
             child.destroy()
         if not streams:
-            self._set_loading(category, "No live streams found.")
+            self._set_stream_message("No live streams found for this category.")
             return
-        for stream in streams:
-            card = ctk.CTkFrame(frame, fg_color="#151a2a", corner_radius=10, border_width=1, border_color="#26334f")
+        for index, stream in enumerate(streams, start=1):
+            card = ctk.CTkFrame(self.stream_frame, fg_color="#151a2a", corner_radius=10, border_width=1, border_color="#26334f")
             card.pack(fill="x", padx=4, pady=6)
-            header = ctk.CTkFrame(card, fg_color="transparent")
-            header.pack(fill="x", padx=12, pady=(10, 2))
-            ctk.CTkLabel(
-                header,
-                text=stream["display_name"],
-                font=ctk.CTkFont(size=15, weight="bold"),
-                text_color="#f6f8ff",
-            ).pack(side="left", anchor="w")
+            card.grid_columnconfigure(1, weight=1)
+            rank = ctk.CTkLabel(
+                card,
+                text=f"{index:02d}",
+                font=ctk.CTkFont(size=13, weight="bold"),
+                text_color="#72f2c7",
+                width=40,
+            )
+            rank.grid(row=0, column=0, rowspan=2, sticky="n", padx=(12, 4), pady=12)
             ctk.CTkLabel(
                 card,
-                text=stream["title"],
+                text=stream["display_name"],
+                font=ctk.CTkFont(size=16, weight="bold"),
+                text_color="#f6f8ff",
+                anchor="w",
+            ).grid(row=0, column=1, sticky="ew", padx=(4, 12), pady=(10, 0))
+            ctk.CTkLabel(
+                card,
+                text=stream["title"] or "Untitled live stream",
                 font=ctk.CTkFont(size=12),
                 text_color="#a7b0c8",
-                wraplength=620,
+                wraplength=560,
                 justify="left",
-            ).pack(anchor="w", padx=12, pady=(0, 8))
+                anchor="w",
+            ).grid(row=1, column=1, sticky="ew", padx=(4, 12), pady=(2, 10))
             actions = ctk.CTkFrame(card, fg_color="transparent")
-            actions.pack(fill="x", padx=12, pady=(0, 10))
+            actions.grid(row=0, column=2, rowspan=2, sticky="e", padx=12, pady=10)
             ctk.CTkButton(
                 actions,
                 text="Load",
-                width=80,
+                width=76,
                 fg_color="#26304a",
                 hover_color="#34405f",
                 command=lambda url=stream["url"]: self._load_stream(url),
-            ).pack(side="left")
+            ).pack(anchor="e", pady=(0, 6))
             ctk.CTkButton(
                 actions,
                 text="Play",
-                width=80,
+                width=76,
                 command=lambda url=stream["url"]: self._play_stream(url),
-            ).pack(side="left", padx=(8, 0))
+            ).pack(anchor="e")
 
     def _load_stream(self, url: str) -> None:
         self.app.url_entry.delete(0, "end")
@@ -1484,7 +1677,7 @@ class TwitchChatReader:
             raw_sock = socket.create_connection((TWITCH_IRC_HOST, TWITCH_IRC_PORT), timeout=10)
             sock = context.wrap_socket(raw_sock, server_hostname=TWITCH_IRC_HOST)
             self.sock = sock
-            sock.settimeout(1.0)
+            sock.settimeout(CHAT_SOCKET_TIMEOUT_SECONDS)
 
             self._send(f"PASS {self.token}")
             self._send(f"NICK {self.nick}")
@@ -1565,6 +1758,8 @@ class TwitchAudioApp(ctk.CTk):
         self.chat_stop_event: threading.Event | None = None
         self.chat_reader: TwitchChatReader | None = None
         self.chat_channel: str | None = None
+        self.pending_chat_messages: list[tuple[str, str, str, str]] = []
+        self.chat_flush_after_id: str | None = None
         self.volume_restart_after_id: str | None = None
         self.suppress_volume_restart = False
         self.is_streaming = False
@@ -1582,6 +1777,12 @@ class TwitchAudioApp(ctk.CTk):
         self.video_last_quality = ""
         self.video_last_volume = 2.0
         self.stopping_stream = False
+        self.stream_health = "Idle"
+        self.process_log_tails: dict[str, list[str]] = {}
+        self.diagnostic_last_emit: dict[str, float] = {}
+        self.diagnostics_visible = False
+        self.chat_line_count = 0
+        self.fullscreen_video = False
 
         self.title("TwitchAudio Command Deck")
         self.geometry("1180x760")
@@ -1592,13 +1793,14 @@ class TwitchAudioApp(ctk.CTk):
         self._build_ui()
         self.refresh_history()
         self.log("Encrypted history vault unlocked.")
-        self.after(300, self.process_events)
+        self.after(EVENT_POLL_IDLE_MS, self.process_events)
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        sidebar = ctk.CTkFrame(self, width=285, fg_color="#0d111f", corner_radius=0)
+        self.sidebar = ctk.CTkFrame(self, width=285, fg_color="#0d111f", corner_radius=0)
+        sidebar = self.sidebar
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
 
@@ -1620,33 +1822,13 @@ class TwitchAudioApp(ctk.CTk):
                 text_color="#f6f8ff",
             ).pack(anchor="w", padx=26, pady=(32, 2))
 
-        self.status_card = ctk.CTkFrame(sidebar, fg_color="#151a2a", corner_radius=22, border_width=1, border_color="#26334f")
-        self.status_card.pack(fill="x", padx=22, pady=(32, 18))
-
-        self.status_label = ctk.CTkLabel(
-            self.status_card,
-            text="Ready",
-            font=ctk.CTkFont(size=22, weight="bold"),
-            text_color="#72f2c7",
-        )
-        self.status_label.pack(anchor="w", padx=20, pady=(18, 4))
-        self.now_playing_label = ctk.CTkLabel(
-            self.status_card,
-            text="No active stream",
-            font=ctk.CTkFont(size=13),
-            text_color="#a7b0c8",
-            wraplength=220,
-            justify="left",
-        )
-        self.now_playing_label.pack(anchor="w", padx=20, pady=(0, 18))
-
         ctk.CTkButton(
             sidebar,
             text="Settings",
             fg_color="#26304a",
             hover_color="#34405f",
             command=self.open_settings,
-        ).pack(fill="x", padx=22, pady=(4, 8))
+        ).pack(fill="x", padx=22, pady=(28, 8))
         ctk.CTkButton(
             sidebar,
             text="Add Stream",
@@ -1668,14 +1850,6 @@ class TwitchAudioApp(ctk.CTk):
             hover_color="#34405f",
             command=self.open_diagnostics,
         ).pack(fill="x", padx=22, pady=8)
-        self.pop_video_button = ctk.CTkButton(
-            sidebar,
-            text="Pop Out Video",
-            fg_color="#26304a",
-            hover_color="#34405f",
-            command=self.toggle_video_popout,
-        )
-        self.pop_video_button.pack(fill="x", padx=22, pady=8)
         ctk.CTkButton(
             sidebar,
             text="Change Vault Password",
@@ -1713,14 +1887,17 @@ class TwitchAudioApp(ctk.CTk):
             justify="left",
         ).pack(side="bottom", anchor="w", padx=24, pady=24)
 
-        main = ctk.CTkFrame(self, fg_color="#080a12", corner_radius=0)
+        self.main = ctk.CTkFrame(self, fg_color="#080a12", corner_radius=0)
+        main = self.main
         main.grid(row=0, column=1, sticky="nsew", padx=26, pady=26)
         main.grid_columnconfigure(0, weight=1)
         main.grid_rowconfigure(2, weight=1)
 
-        hero = ctk.CTkFrame(main, fg_color="#121625", corner_radius=24, border_width=1, border_color="#24304a")
+        self.hero = ctk.CTkFrame(main, fg_color="#121625", corner_radius=24, border_width=1, border_color="#24304a")
+        hero = self.hero
         hero.grid(row=0, column=0, sticky="ew")
         hero.grid_columnconfigure(0, weight=1)
+        hero.grid_columnconfigure(1, weight=0)
 
         ctk.CTkLabel(
             hero,
@@ -1734,6 +1911,28 @@ class TwitchAudioApp(ctk.CTk):
             font=ctk.CTkFont(size=11),
             text_color="#8b96b3",
         ).grid(row=1, column=0, sticky="w", padx=18, pady=(2, 10))
+
+        self.status_card = ctk.CTkFrame(hero, width=245, height=76, fg_color="#151a2a", corner_radius=14, border_width=1, border_color="#26334f")
+        self.status_card.grid(row=0, column=1, rowspan=2, sticky="ne", padx=18, pady=(12, 4))
+        self.status_card.grid_propagate(False)
+        self.status_label = ctk.CTkLabel(
+            self.status_card,
+            text="Ready",
+            font=ctk.CTkFont(size=18, weight="bold"),
+            text_color="#72f2c7",
+            anchor="w",
+        )
+        self.status_label.pack(fill="x", padx=16, pady=(12, 2))
+        self.now_playing_label = ctk.CTkLabel(
+            self.status_card,
+            text="No active stream",
+            font=ctk.CTkFont(size=12),
+            text_color="#a7b0c8",
+            wraplength=210,
+            justify="left",
+            anchor="w",
+        )
+        self.now_playing_label.pack(fill="x", padx=16, pady=(0, 12))
 
         controls = ctk.CTkFrame(hero, fg_color="transparent")
         controls.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 14))
@@ -1780,60 +1979,81 @@ class TwitchAudioApp(ctk.CTk):
         )
         self.stop_button.pack(side="left")
 
-        content = ctk.CTkFrame(main, fg_color="transparent")
+        self.content = ctk.CTkFrame(main, fg_color="transparent")
+        content = self.content
         content.grid(row=2, column=0, sticky="nsew", pady=(22, 0))
         content.grid_columnconfigure(0, weight=3)
         content.grid_columnconfigure(1, weight=2)
         content.grid_rowconfigure(0, weight=1)
 
-        video_shell = ctk.CTkFrame(content, fg_color="#121625", corner_radius=24, border_width=1, border_color="#24304a")
+        self.video_shell = ctk.CTkFrame(content, fg_color="#121625", corner_radius=24, border_width=1, border_color="#24304a")
+        video_shell = self.video_shell
         video_shell.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
         video_shell.grid_rowconfigure(1, weight=1)
         video_shell.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(
+        self.video_title_label = ctk.CTkLabel(
             video_shell,
             text="Video",
             font=ctk.CTkFont(size=22, weight="bold"),
             text_color="#f6f8ff",
-        ).grid(row=0, column=0, sticky="w", padx=22, pady=(22, 8))
+        )
+        self.video_title_label.grid(row=0, column=0, sticky="w", padx=22, pady=(22, 8))
 
-        video_panel = ctk.CTkFrame(video_shell, fg_color="#080a12", corner_radius=14, border_width=1, border_color="#24304a")
-        video_panel.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 16))
+        self.video_panel = ctk.CTkFrame(video_shell, fg_color="#080a12", corner_radius=14, border_width=1, border_color="#24304a")
+        video_panel = self.video_panel
+        video_panel.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
         video_panel.grid_columnconfigure(0, weight=1)
         video_panel.grid_rowconfigure(1, weight=1)
         self.video_status_label = ctk.CTkLabel(
             video_panel,
-            text="Video is ready. Choose Video mode and a resolution, or pop it into its own window.",
+            text=VIDEO_READY_MESSAGE,
             font=ctk.CTkFont(size=13),
             text_color="#a7b0c8",
             wraplength=640,
             justify="left",
         )
-        self.video_status_label.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 8))
+        self.video_status_label.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 6))
         self.video_surface = ctk.CTkFrame(video_panel, fg_color="#000000", corner_radius=8)
         self.video_surface.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 10))
-        ctk.CTkLabel(
+        self.video_surface.bind("<Double-Button-1>", self.toggle_embedded_fullscreen)
+        video_placeholder = ctk.CTkLabel(
             self.video_surface,
-            text="",
+            text="Double-click for fullscreen",
             text_color="#6f7a92",
-        ).pack(expand=True)
-        ctk.CTkLabel(
+        )
+        video_placeholder.pack(expand=True)
+        video_placeholder.bind("<Double-Button-1>", self.toggle_embedded_fullscreen)
+        self.video_hint_label = ctk.CTkLabel(
             video_panel,
-            text="Start Video embeds here with mpv. Pop Out uses a separate ffplay window.",
+            text="Start Video embeds here with mpv. Player Window uses streamlink with a separate ffplay window.",
             font=ctk.CTkFont(size=12),
             text_color="#6f7a92",
             wraplength=640,
             justify="left",
-        ).grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
-        ctk.CTkButton(
+        )
+        self.video_hint_label.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
+        self.pop_video_button = ctk.CTkButton(
             video_panel,
-            text="Pop Out Video Window",
+            text="Start Player Window",
             height=40,
+            fg_color="#26304a",
+            hover_color="#34405f",
             command=self.toggle_video_popout,
-        ).grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
+        )
+        self.pop_video_button.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
+        self.stream_health_label = ctk.CTkLabel(
+            video_shell,
+            text="Health: Idle",
+            font=ctk.CTkFont(size=12, weight="bold"),
+            text_color="#7f8aa6",
+            anchor="w",
+        )
+        self.stream_health_label.grid(row=2, column=0, sticky="ew", padx=22, pady=(0, 16))
+        self.bind("<Escape>", self.exit_embedded_fullscreen)
 
-        side_stack = ctk.CTkFrame(content, fg_color="transparent")
+        self.side_stack = ctk.CTkFrame(content, fg_color="transparent")
+        side_stack = self.side_stack
         side_stack.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
         side_stack.grid_columnconfigure(0, weight=1)
         side_stack.grid_rowconfigure(0, weight=1)
@@ -1887,6 +2107,7 @@ class TwitchAudioApp(ctk.CTk):
             "Open Settings to save encrypted Twitch chat credentials.\n"
             "Or click Open Popout to view chat in your browser without app chat auth.\n",
         )
+        self.chat_line_count = 2
         self.chat_box.configure(state="disabled")
 
         chat_send = ctk.CTkFrame(chat_shell, fg_color="transparent")
@@ -1922,6 +2143,7 @@ class TwitchAudioApp(ctk.CTk):
             return
 
         self.log_window = ctk.CTkToplevel(self)
+        self.diagnostics_visible = True
         self.log_window.title("TwitchAudio Diagnostics")
         self.log_window.geometry("720x460")
         self.log_window.configure(fg_color="#090b13")
@@ -1943,6 +2165,7 @@ class TwitchAudioApp(ctk.CTk):
         self.log_box.configure(state="disabled")
 
     def _close_diagnostics(self) -> None:
+        self.diagnostics_visible = False
         if self.log_window:
             self.log_window.destroy()
         self.log_window = None
@@ -2007,8 +2230,28 @@ class TwitchAudioApp(ctk.CTk):
         message = sanitize_chat_message(message)
         self.chat_box.configure(state="normal")
         self.chat_box.insert("end", f"[{timestamp}] {message}\n")
+        self.chat_line_count += 1
+        if self.chat_line_count > MAX_CHAT_LINES + CHAT_UI_TRIM_BATCH:
+            self.chat_box.delete("1.0", f"{CHAT_UI_TRIM_BATCH + 1}.0")
+            self.chat_line_count -= CHAT_UI_TRIM_BATCH
         self.chat_box.see("end")
         self.chat_box.configure(state="disabled")
+
+    def queue_chat_save(self, channel: str, user: str, message: str, direction: str) -> None:
+        self.pending_chat_messages.append((channel, user, message, direction))
+        if self.chat_flush_after_id is None:
+            self.chat_flush_after_id = self.after(CHAT_SAVE_BATCH_MS, self.flush_chat_saves)
+
+    def flush_chat_saves(self) -> None:
+        self.chat_flush_after_id = None
+        if not self.pending_chat_messages:
+            return
+        messages = self.pending_chat_messages
+        self.pending_chat_messages = []
+        try:
+            self.history.save_chat_messages(messages)
+        except Exception as exc:
+            self.log(f"Chat transcript save failed: {exc}")
 
     def load_chat_history(self, channel: str) -> None:
         records = self.history.list_chat_messages(channel)
@@ -2020,6 +2263,12 @@ class TwitchAudioApp(ctk.CTk):
             timestamp = display_time(record.created_at)
             prefix = "You" if record.direction == "out" else record.user
             self.chat_box.insert("end", f"[{timestamp}] {prefix}: {record.message}\n")
+        self.chat_line_count += len(records) + 1
+        if self.chat_line_count > MAX_CHAT_LINES + CHAT_UI_TRIM_BATCH:
+            extra_batches = max(1, (self.chat_line_count - MAX_CHAT_LINES) // CHAT_UI_TRIM_BATCH)
+            lines_to_delete = extra_batches * CHAT_UI_TRIM_BATCH
+            self.chat_box.delete("1.0", f"{lines_to_delete + 1}.0")
+            self.chat_line_count -= lines_to_delete
         self.chat_box.see("end")
         self.chat_box.configure(state="disabled")
 
@@ -2085,7 +2334,7 @@ class TwitchAudioApp(ctk.CTk):
 
         self.chat_entry.delete(0, "end")
         if self.chat_channel:
-            self.history.save_chat_message(self.chat_channel, "You", message, "out")
+            self.queue_chat_save(self.chat_channel, "You", message, "out")
         self.add_chat_line(f"You: {message}")
 
     def open_chat_popout(self) -> None:
@@ -2129,10 +2378,12 @@ class TwitchAudioApp(ctk.CTk):
             self.refresh_online_statuses(records)
 
     def refresh_online_statuses(self, records: list[StreamRecord] | None = None) -> None:
-        if self.online_refresh_in_progress or time.time() - self.last_online_refresh < 45:
+        if self.is_streaming or self.is_video_popped:
+            return
+        if self.online_refresh_in_progress or time.time() - self.last_online_refresh < ONLINE_STATUS_REFRESH_SECONDS:
             return
         records = records if records is not None else self.history.list_streams()
-        channels = [channel for record in records if (channel := twitch_channel_from_url(record.url))]
+        channels = sorted({channel.lower() for record in records if (channel := twitch_channel_from_url(record.url))})
         if not channels:
             return
         self.online_refresh_in_progress = True
@@ -2152,17 +2403,47 @@ class TwitchAudioApp(ctk.CTk):
         return [
             "streamlink",
             "--loglevel",
-            "none",
+            "warning",
             "--stdout",
             "--twitch-disable-ads",
             "--stream-segment-threads",
-            "2",
+            STREAMLINK_SEGMENT_THREADS,
+            "--stream-segment-attempts",
+            "10",
+            "--stream-segment-timeout",
+            "20",
+            "--hls-live-edge",
+            "8",
+            "--hls-playlist-reload-attempts",
+            "15",
+            "--retry-streams",
+            "10",
+            "--retry-open",
+            "10",
+            "--ringbuffer-size",
+            STREAMLINK_RINGBUFFER_SIZE,
             url,
             quality,
         ]
 
-    def _ffplay_command(self, volume: float, video_mode: bool) -> list[str]:
-        command = [
+    def _ffplay_command(self, volume: float) -> list[str]:
+        return [
+            "ffplay",
+            "-autoexit",
+            "-nodisp",
+            "-f",
+            "mpegts",
+            "-af",
+            f"volume={volume:.1f}",
+            "-fflags",
+            "nobuffer",
+            "-flags",
+            "low_delay",
+            "-",
+        ]
+
+    def _ffplay_video_command(self, volume: float) -> list[str]:
+        return [
             "ffplay",
             "-autoexit",
             "-f",
@@ -2175,9 +2456,6 @@ class TwitchAudioApp(ctk.CTk):
             "low_delay",
             "-",
         ]
-        if not video_mode:
-            command.insert(1, "-nodisp")
-        return command
 
     def _embedded_mpv_command(self, volume: float) -> list[str]:
         self.update_idletasks()
@@ -2187,21 +2465,61 @@ class TwitchAudioApp(ctk.CTk):
             "--no-config",
             f"--wid={window_id}",
             "--cache=yes",
-            "--cache-secs=12",
-            "--demuxer-readahead-secs=12",
-            "--demuxer-max-bytes=64MiB",
-            "--demuxer-max-back-bytes=16MiB",
+            f"--cache-secs={VIDEO_CACHE_SECONDS}",
+            f"--demuxer-readahead-secs={VIDEO_CACHE_SECONDS}",
+            "--demuxer-max-bytes=512MiB",
+            "--demuxer-max-back-bytes=128MiB",
+            "--vd-lavc-threads=4",
+            "--vd-lavc-fast=yes",
+            "--vd-lavc-skiploopfilter=nonref",
             "--force-window=yes",
             "--vo=x11",
-            "--framedrop=vo",
+            "--hwdec=auto-safe",
+            "--framedrop=decoder+vo",
+            "--osc=no",
+            "--osd-level=0",
+            "--audio-display=no",
+            "--sws-fast=yes",
+            "--sws-scaler=fast-bilinear",
             "--untimed=no",
-            "--video-sync=audio",
+            "--video-sync=display-resample",
+            "--input-default-bindings=no",
+            "--input-vo-keyboard=no",
             "--demuxer-lavf-format=mpegts",
             f"--volume={max(0, min(volume * 100, 300)):.0f}",
             "-",
         ]
 
-    def _process_error_tail(self, process: subprocess.Popen[bytes] | None) -> str:
+    def _start_stderr_drain(self, process: subprocess.Popen[bytes] | None, name: str) -> None:
+        if process is None or process.stderr is None:
+            return
+        self.process_log_tails[name] = []
+
+        def drain() -> None:
+            assert process.stderr is not None
+            while True:
+                try:
+                    raw = process.stderr.readline()
+                except Exception:
+                    return
+                if not raw:
+                    return
+                line = sanitize_text(raw.decode("utf-8", errors="replace"), max_chars=1200)
+                if not line:
+                    continue
+                tail = self.process_log_tails.setdefault(name, [])
+                tail.append(line)
+                del tail[:-25]
+                now = time.time()
+                if self.diagnostics_visible and now - self.diagnostic_last_emit.get(name, 0.0) >= DIAGNOSTIC_LOG_INTERVAL_SECONDS:
+                    self.diagnostic_last_emit[name] = now
+                    self.event_queue.put(("diagnostic", f"{name}: {line}"))
+
+        threading.Thread(target=drain, daemon=True).start()
+
+    def _process_error_tail(self, process: subprocess.Popen[bytes] | None, name: str | None = None) -> str:
+        if name and self.process_log_tails.get(name):
+            return "\n".join(self.process_log_tails[name])[-1200:]
         if process is None or process.stderr is None:
             return ""
         try:
@@ -2209,6 +2527,98 @@ class TwitchAudioApp(ctk.CTk):
         except Exception:
             return ""
         return raw.decode("utf-8", errors="replace").strip()[-1200:]
+
+    def toggle_embedded_fullscreen(self, _event: object | None = None) -> None:
+        if self.fullscreen_video:
+            self.exit_embedded_fullscreen()
+            return
+        self.fullscreen_video = True
+        self._set_video_only_fullscreen(True)
+        self.attributes("-fullscreen", True)
+        self.video_status_label.configure(text="Fullscreen enabled. Press Esc or double-click the video area to exit.")
+        self.log("Video fullscreen enabled.")
+
+    def exit_embedded_fullscreen(self, _event: object | None = None) -> None:
+        if not self.fullscreen_video:
+            return
+        self.fullscreen_video = False
+        self.attributes("-fullscreen", False)
+        self._set_video_only_fullscreen(False)
+        self.video_status_label.configure(text=VIDEO_READY_MESSAGE, text_color="#a7b0c8")
+        self.log("Video fullscreen disabled.")
+
+    def _set_video_only_fullscreen(self, enabled: bool) -> None:
+        if enabled:
+            self.sidebar.grid_remove()
+            self.hero.grid_remove()
+            self.side_stack.grid_remove()
+            self.video_title_label.grid_remove()
+            self.video_status_label.grid_remove()
+            self.video_hint_label.grid_remove()
+            self.pop_video_button.grid_remove()
+            self.stream_health_label.grid_remove()
+
+            self.main.grid_configure(row=0, column=0, columnspan=2, sticky="nsew", padx=0, pady=0)
+            self.main.grid_rowconfigure(0, weight=1)
+            self.main.grid_rowconfigure(2, weight=0)
+            self.content.grid_configure(row=0, column=0, sticky="nsew", pady=0)
+            self.content.grid_columnconfigure(0, weight=1)
+            self.content.grid_columnconfigure(1, weight=0)
+            self.video_shell.grid_configure(row=0, column=0, sticky="nsew", padx=0)
+            self.video_shell.grid_rowconfigure(0, weight=1)
+            self.video_shell.grid_rowconfigure(1, weight=0)
+            self.video_shell.configure(fg_color="#000000", corner_radius=0, border_width=0)
+            self.video_panel.grid_configure(row=0, column=0, sticky="nsew", padx=0, pady=0)
+            self.video_panel.grid_rowconfigure(0, weight=1)
+            self.video_panel.grid_rowconfigure(1, weight=0)
+            self.video_panel.configure(fg_color="#000000", corner_radius=0, border_width=0)
+            self.video_surface.grid_configure(row=0, column=0, sticky="nsew", padx=0, pady=0)
+            self.video_surface.configure(corner_radius=0)
+        else:
+            self.main.grid_configure(row=0, column=1, columnspan=1, sticky="nsew", padx=26, pady=26)
+            self.main.grid_rowconfigure(0, weight=0)
+            self.main.grid_rowconfigure(2, weight=1)
+            self.hero.grid(row=0, column=0, sticky="ew")
+            self.content.grid_configure(row=2, column=0, sticky="nsew", pady=(22, 0))
+            self.content.grid_columnconfigure(0, weight=3)
+            self.content.grid_columnconfigure(1, weight=2)
+            self.video_shell.grid_configure(row=0, column=0, sticky="nsew", padx=(0, 12))
+            self.video_shell.grid_rowconfigure(0, weight=0)
+            self.video_shell.grid_rowconfigure(1, weight=1)
+            self.video_shell.configure(fg_color="#121625", corner_radius=24, border_width=1)
+            self.video_title_label.grid(row=0, column=0, sticky="w", padx=22, pady=(22, 8))
+            self.video_panel.grid_configure(row=1, column=0, sticky="nsew", padx=16, pady=(0, 8))
+            self.video_panel.grid_rowconfigure(0, weight=0)
+            self.video_panel.grid_rowconfigure(1, weight=1)
+            self.video_panel.configure(fg_color="#080a12", corner_radius=14, border_width=1)
+            self.video_status_label.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 6))
+            self.video_surface.grid_configure(row=1, column=0, sticky="nsew", padx=16, pady=(0, 10))
+            self.video_surface.configure(corner_radius=8)
+            self.video_hint_label.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
+            self.pop_video_button.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
+            self.stream_health_label.grid(row=2, column=0, sticky="ew", padx=22, pady=(0, 16))
+            self.side_stack.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
+            self.sidebar.grid(row=0, column=0, sticky="nsew")
+
+        self.update_idletasks()
+
+    def set_stream_health(self, state: str, detail: str = "") -> None:
+        colors = {
+            "Idle": "#7f8aa6",
+            "Healthy": "#72f2c7",
+            "Buffering": "#ffb86c",
+            "Recovering": "#8cbcff",
+            "Stopped": "#ff5f7a",
+        }
+        previous = getattr(self, "stream_health", "")
+        self.stream_health = state
+        message = f"Health: {state}"
+        if detail:
+            message = f"{message} - {detail}"
+        if hasattr(self, "stream_health_label"):
+            self.stream_health_label.configure(text=message, text_color=colors.get(state, "#7f8aa6"))
+        if previous != state or detail:
+            self.log(message)
 
     def _selected_stream(self) -> tuple[str, str, float] | None:
         url = sanitize_text(self.url_entry.get(), max_chars=300)
@@ -2226,6 +2636,8 @@ class TwitchAudioApp(ctk.CTk):
         if self.is_streaming:
             self.log("A stream is already running.")
             return False
+        if self.is_video_popped:
+            self.stop_video_popout(user_requested=False)
         self.video_restart_attempts = 0
 
         selected = self._selected_stream()
@@ -2253,6 +2665,7 @@ class TwitchAudioApp(ctk.CTk):
             if video_mode:
                 self._start_embedded_video_pipe(url, quality, volume)
                 self.video_status_label.configure(text=f"Playing in app: {channel_name_from_url(url)} at {quality}")
+                self.set_stream_health("Healthy", f"{quality} buffer {VIDEO_CACHE_SECONDS}s")
             else:
                 self.stream_process = subprocess.Popen(
                     self._streamlink_command(url, quality),
@@ -2263,7 +2676,7 @@ class TwitchAudioApp(ctk.CTk):
                     raise RuntimeError("streamlink did not provide an audio pipe.")
 
                 self.play_process = subprocess.Popen(
-                    self._ffplay_command(volume, video_mode=False),
+                    self._ffplay_command(volume),
                     stdin=self.stream_process.stdout,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -2276,7 +2689,7 @@ class TwitchAudioApp(ctk.CTk):
             return False
 
         self.history.save_launch(url, quality, volume, count_play=count_play, playback_mode=self.playback_mode_option.get())
-        self.refresh_history()
+        self.refresh_history(check_online=False)
         self.is_streaming = True
         self.status_label.configure(text="Streaming", text_color="#72f2c7")
         self.now_playing_label.configure(text=f"{channel_name_from_url(url)} using {quality}")
@@ -2301,6 +2714,7 @@ class TwitchAudioApp(ctk.CTk):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
+        self._start_stderr_drain(self.stream_process, "streamlink")
         if self.stream_process.stdout is None:
             raise RuntimeError("streamlink did not provide a video pipe.")
         self.embedded_video_process = subprocess.Popen(
@@ -2309,6 +2723,7 @@ class TwitchAudioApp(ctk.CTk):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
+        self._start_stderr_drain(self.embedded_video_process, "mpv")
         self.stream_process.stdout.close()
 
     def _cleanup_video_pipe(self) -> None:
@@ -2349,6 +2764,9 @@ class TwitchAudioApp(ctk.CTk):
             self.log("Missing dependency: " + ", ".join(missing))
             return False
 
+        if self.is_streaming:
+            self.stop_stream(user_requested=False)
+
         try:
             self.video_stream_process = subprocess.Popen(
                 self._streamlink_command(url, quality),
@@ -2358,7 +2776,7 @@ class TwitchAudioApp(ctk.CTk):
             if self.video_stream_process.stdout is None:
                 raise RuntimeError("streamlink did not provide a video pipe.")
             self.video_play_process = subprocess.Popen(
-                self._ffplay_command(volume, video_mode=True),
+                self._ffplay_video_command(volume),
                 stdin=self.video_stream_process.stdout,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -2366,14 +2784,21 @@ class TwitchAudioApp(ctk.CTk):
             self.video_stream_process.stdout.close()
         except Exception as exc:
             self.stop_video_popout(user_requested=False)
-            messagebox.showerror("Could not start video", str(exc))
-            self.log(f"Video popout failed: {exc}")
+            messagebox.showerror("Could not start player window", str(exc))
+            self.log(f"Player window failed: {exc}")
             return False
 
+        self.history.save_launch(url, quality, volume, playback_mode=PLAYBACK_LOW_VIDEO)
+        self.refresh_history(check_online=False)
         self.is_video_popped = True
-        self.pop_video_button.configure(text="Stop Video")
-        self.video_status_label.configure(text=f"Video popped out: {channel_name_from_url(url)} at {quality}")
-        self.log(f"Started video popout {quality}: {url}")
+        self.pop_video_button.configure(text="Stop Player Window")
+        self.status_label.configure(text="Streaming", text_color="#72f2c7")
+        self.now_playing_label.configure(text=f"{channel_name_from_url(url)} using {quality}")
+        self.start_button.configure(state="disabled")
+        self.stop_button.configure(state="normal")
+        self.video_status_label.configure(text=f"Playing in player window: {channel_name_from_url(url)} at {quality}", text_color="#a7b0c8")
+        self.set_stream_health("Healthy", "player window")
+        self.log(f"Started player window {quality}: {url}")
         threading.Thread(target=self.monitor_video_popout, args=(url,), daemon=True).start()
         return True
 
@@ -2392,21 +2817,30 @@ class TwitchAudioApp(ctk.CTk):
         self.video_stream_process = None
         self.video_play_process = None
         self.is_video_popped = False
-        self.pop_video_button.configure(text="Pop Out Video")
-        self.video_status_label.configure(text="Video is ready. Choose Video mode and a resolution, or pop it into its own window.")
+        self.pop_video_button.configure(text="Start Player Window")
+        self.video_status_label.configure(text=VIDEO_READY_MESSAGE, text_color="#a7b0c8")
+        self.set_stream_health("Idle" if user_requested else "Stopped")
+        self.status_label.configure(text="Ready", text_color="#72f2c7")
+        self.now_playing_label.configure(text="No active stream")
+        self.start_button.configure(state="normal")
+        self.stop_button.configure(state="disabled")
         if user_requested:
-            self.log("Stopped video popout.")
+            self.log("Stopped player window.")
 
     def monitor_video_popout(self, url: str) -> None:
         while self.is_video_popped:
             stream_code = self.video_stream_process.poll() if self.video_stream_process else None
             play_code = self.video_play_process.poll() if self.video_play_process else None
             if stream_code is not None or play_code is not None:
-                self.event_queue.put(("video_stopped", f"Video ended: {channel_name_from_url(url)}"))
+                self.event_queue.put(("video_popout_stopped", f"Player window ended: {channel_name_from_url(url)}"))
                 return
-            time.sleep(1)
+            time.sleep(PROCESS_MONITOR_INTERVAL_SECONDS)
 
     def stop_stream(self, user_requested: bool) -> None:
+        if self.is_video_popped:
+            self.stop_video_popout(user_requested=user_requested)
+            if not self.is_streaming:
+                return
         self.stopping_stream = True
         self.cancel_volume_restart()
         if self.video_restart_after_id is not None:
@@ -2430,7 +2864,9 @@ class TwitchAudioApp(ctk.CTk):
         self.play_process = None
         self.embedded_video_process = None
         self.is_streaming = False
-        self.video_status_label.configure(text="Video is ready. Choose Video mode and a resolution, or pop it into its own window.")
+        self.exit_embedded_fullscreen()
+        self.video_status_label.configure(text=VIDEO_READY_MESSAGE, text_color="#a7b0c8")
+        self.set_stream_health("Idle" if user_requested else "Stopped")
         self.status_label.configure(text="Ready", text_color="#72f2c7")
         self.now_playing_label.configure(text="No active stream")
         self.start_button.configure(state="normal")
@@ -2440,10 +2876,21 @@ class TwitchAudioApp(ctk.CTk):
         self.stopping_stream = False
 
     def monitor_stream(self, url: str) -> None:
+        started_at = time.time()
+        last_heartbeat = 0.0
         while self.is_streaming:
             stream_code = self.stream_process.poll() if self.stream_process else None
             play_code = self.play_process.poll() if self.play_process else None
             embedded_code = self.embedded_video_process.poll() if self.embedded_video_process else None
+            now = time.time()
+            if now - last_heartbeat >= PROCESS_HEARTBEAT_SECONDS:
+                last_heartbeat = now
+                player_name = "mpv" if self.embedded_video_process is not None else "ffplay"
+                if self.diagnostics_visible:
+                    self.event_queue.put((
+                        "diagnostic",
+                        f"Pipeline alive {int(now - started_at)}s: streamlink={stream_code if stream_code is not None else 'running'}, {player_name}={embedded_code if self.embedded_video_process is not None and embedded_code is not None else play_code if play_code is not None else 'running'}",
+                    ))
             if stream_code is not None or play_code is not None or embedded_code is not None:
                 if self.stopping_stream:
                     return
@@ -2460,23 +2907,23 @@ class TwitchAudioApp(ctk.CTk):
                 details = [f"Stream ended: {channel_name_from_url(url)}"]
                 if stream_code is not None:
                     details.append(f"streamlink exit={stream_code}")
-                    stream_error = self._process_error_tail(self.stream_process)
+                    stream_error = self._process_error_tail(self.stream_process, "streamlink")
                     if stream_error:
                         details.append(f"streamlink: {stream_error}")
                 if play_code is not None:
                     details.append(f"ffplay exit={play_code}")
-                    play_error = self._process_error_tail(self.play_process)
+                    play_error = self._process_error_tail(self.play_process, "ffplay")
                     if play_error:
                         details.append(f"ffplay: {play_error}")
                 if embedded_code is not None:
                     details.append(f"mpv exit={embedded_code}")
-                    mpv_error = self._process_error_tail(self.embedded_video_process)
+                    mpv_error = self._process_error_tail(self.embedded_video_process, "mpv")
                     if mpv_error:
                         details.append(f"mpv: {mpv_error}")
                 event = "video_retry" if self.embedded_video_process is not None or embedded_code is not None else "stopped"
                 self.event_queue.put((event, "\n".join(details)))
                 return
-            time.sleep(1)
+            time.sleep(PROCESS_MONITOR_INTERVAL_SECONDS)
 
     def retry_embedded_video(self, detail: str) -> None:
         if not self.is_streaming or self.stopping_stream:
@@ -2486,16 +2933,18 @@ class TwitchAudioApp(ctk.CTk):
             self.log(detail)
             return
         self.log(detail)
-        if self.video_restart_attempts >= 5:
+        if self.video_restart_attempts >= VIDEO_RETRY_LIMIT:
             self.video_status_label.configure(text="Video stopped after repeated buffering retries.", text_color="#ffb86c")
+            self.set_stream_health("Stopped", "retry limit reached")
             self.stop_stream(user_requested=False)
             return
         self.video_restart_attempts += 1
-        delay_ms = min(1200 + self.video_restart_attempts * 900, 6000)
+        delay_ms = min(VIDEO_RETRY_BASE_MS + self.video_restart_attempts * 900, VIDEO_RETRY_MAX_MS)
         self.video_status_label.configure(
-            text=f"Buffering video... retry {self.video_restart_attempts}/5",
+            text=f"Buffering video... reconnect {self.video_restart_attempts}/{VIDEO_RETRY_LIMIT}",
             text_color="#ffb86c",
         )
+        self.set_stream_health("Buffering", f"reconnect {self.video_restart_attempts}/{VIDEO_RETRY_LIMIT}")
         self._cleanup_video_pipe()
         self.video_restart_after_id = self.after(delay_ms, self._restart_embedded_video)
 
@@ -2512,12 +2961,16 @@ class TwitchAudioApp(ctk.CTk):
             text=f"Playing in app: {channel_name_from_url(self.video_last_url)} at {self.video_last_quality}",
             text_color="#a7b0c8",
         )
+        self.set_stream_health("Recovering", "buffer refilled")
+        self.after(5000, lambda: self.set_stream_health("Healthy", f"{self.video_last_quality} buffer {VIDEO_CACHE_SECONDS}s") if self.is_streaming and not self.stopping_stream else None)
         threading.Thread(target=self.monitor_stream, args=(self.video_last_url,), daemon=True).start()
 
     def process_events(self) -> None:
+        processed = 0
         try:
-            while True:
+            while processed < MAX_EVENTS_PER_TICK:
                 event, detail = self.event_queue.get_nowait()
+                processed += 1
                 if event == "stopped" and self.is_streaming:
                     self.stop_stream(user_requested=False)
                     self.log(detail)
@@ -2525,8 +2978,10 @@ class TwitchAudioApp(ctk.CTk):
                         self.video_status_label.configure(text=detail[:260], text_color="#ffb86c")
                 elif event == "video_retry":
                     self.retry_embedded_video(detail)
-                elif event == "video_stopped" and self.is_video_popped:
+                elif event == "video_popout_stopped" and self.is_video_popped:
                     self.stop_video_popout(user_requested=False)
+                    self.log(detail)
+                elif event == "diagnostic":
                     self.log(detail)
                 elif event == "chat_message":
                     try:
@@ -2538,7 +2993,7 @@ class TwitchAudioApp(ctk.CTk):
                     if message:
                         channel = self.chat_channel or twitch_channel_from_url(self.url_entry.get())
                         if channel:
-                            self.history.save_chat_message(channel, user, message, "in")
+                            self.queue_chat_save(channel, user, message, "in")
                         self.add_chat_line(f"{user}: {message}")
                 elif event == "chat_status":
                     color = "#72f2c7" if detail.startswith("Connected") else "#ffb86c"
@@ -2550,13 +3005,15 @@ class TwitchAudioApp(ctk.CTk):
                     except json.JSONDecodeError:
                         continue
                     self.online_statuses = {str(key): bool(value) for key, value in decoded.items()}
-                    self.refresh_history(check_online=False)
+                    if not self.is_streaming and not self.is_video_popped:
+                        self.refresh_history(check_online=False)
                 elif event == "online_error":
                     self.online_refresh_in_progress = False
                     self.log(detail)
         except queue.Empty:
             pass
-        self.after(300, self.process_events)
+        next_poll_ms = EVENT_POLL_ACTIVE_MS if processed else EVENT_POLL_IDLE_MS
+        self.after(next_poll_ms, self.process_events)
 
     def load_record(self, record: StreamRecord) -> None:
         self.suppress_volume_restart = True
@@ -2603,8 +3060,11 @@ class TwitchAudioApp(ctk.CTk):
         messagebox.showinfo("Password changed", "Saved streams were re-encrypted with the new password.")
 
     def on_close(self) -> None:
+        if self.chat_flush_after_id is not None:
+            self.after_cancel(self.chat_flush_after_id)
+            self.chat_flush_after_id = None
+        self.flush_chat_saves()
         self.disconnect_chat(user_requested=False)
-        self.stop_video_popout(user_requested=False)
         self.stop_stream(user_requested=False)
         self.history.close()
         self.destroy()
@@ -2647,4 +3107,3 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.exit(0)
-
