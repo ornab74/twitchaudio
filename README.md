@@ -2,7 +2,7 @@
 
 Low-bandwidth Twitch listening with a dark CustomTkinter command deck.
 
-TwitchAudio is a tiny desktop app that asks Streamlink for Twitch's `audio_only` stream and pipes that stream directly into `ffplay`. The goal is simple: hear the stream without downloading the 1080p video feed. It also keeps your saved stream history and Twitch chat settings in a local SQLite vault where sensitive payloads are encrypted with a password-derived key.
+TwitchAudio is a tiny desktop app that asks Streamlink for Twitch's `audio_only` stream and pipes that stream directly into `ffplay`. The goal is simple: hear the stream without downloading the 1080p video feed, with an optional low-bandwidth video mode limited to `160p` or `360p`. It also keeps your saved stream history, Twitch app credentials, OAuth tokens, refresh tokens, and chat transcripts in a local SQLite vault where sensitive payloads are encrypted with AES-GCM using a password-derived key.
 
 ![TwitchAudio GUI preview](demo.png)
 
@@ -37,7 +37,7 @@ TwitchAudio is a tiny desktop app that asks Streamlink for Twitch's `audio_only`
 - Stream URLs, display titles, quality, and volume settings encrypted before SQLite writes.
 - One-click BeardHero preset.
 - Play, load, and delete saved streams from the history panel.
-- Optional Twitch chat panel with authenticated in-app IRC chat or browser popout chat.
+- Optional Twitch chat panel with authenticated in-app IRC chat, encrypted chat transcripts, or browser popout chat.
 - Live volume slider with a debounced audio-pipe restart so `ffplay` receives the new filter.
 - Change the history vault password from inside the app.
 - Clear saved stream history without touching source files.
@@ -57,8 +57,8 @@ flowchart LR
     User["User"] --> GUI["CustomTkinter GUI"]
     GUI --> PasswordDialog["Password Dialog"]
     PasswordDialog --> HistoryStore["EncryptedHistoryStore"]
-    HistoryStore --> KDF["PBKDF2-HMAC-SHA256<br/>600k iterations"]
-    KDF --> Fernet["Fernet Key"]
+    HistoryStore --> KDF["Scrypt KDF"]
+    KDF --> AES["AES-256-GCM Key"]
     HistoryStore --> SQLite["SQLite Vault<br/>platform app-data/history.sqlite3"]
     GUI --> StreamControls["URL, audio_only quality, volume"]
     StreamControls --> Streamlink["streamlink --stdout<br/>audio_only"]
@@ -90,7 +90,7 @@ sequenceDiagram
     Streamlink-->>App: Audio bytes on stdout
     App->>FFplay: Start ffplay -nodisp with stdin pipe
     App->>Store: save_launch(url, quality, volume)
-    Store->>Store: Encrypt stream payload with Fernet
+    Store->>Store: Encrypt stream payload with AES-GCM
     Store->>DB: Write encrypted payload and timestamps
     App-->>User: Show Streaming status and diagnostics
     FFplay-->>User: Play audio
@@ -103,12 +103,12 @@ flowchart TD
     Start["App starts"] --> Gate["Open password dialog"]
     Gate --> FirstRun{"history.sqlite3 exists?"}
     FirstRun -- "No" --> CreateSalt["Generate random salt"]
-    CreateSalt --> DeriveNew["Derive Fernet key from password"]
-    DeriveNew --> SaveVerifier["Encrypt verifier token"]
+    CreateSalt --> DeriveNew["Derive AES-GCM key from password"]
+    DeriveNew --> SaveVerifier["Seal verifier token with AES-GCM"]
     SaveVerifier --> NewVault["Create SQLite vault metadata"]
     NewVault --> Launch["Launch main GUI"]
     FirstRun -- "Yes" --> LoadSalt["Load salt and encrypted verifier"]
-    LoadSalt --> DeriveExisting["Derive Fernet key from entered password"]
+    LoadSalt --> DeriveExisting["Derive AES-GCM key from entered password"]
     DeriveExisting --> Verify{"Verifier decrypts?"}
     Verify -- "Yes" --> Launch
     Verify -- "No" --> Retry["Show unlock error and retry"]
@@ -126,7 +126,7 @@ erDiagram
 
     STREAMS {
         INTEGER id PK
-        BLOB payload "Fernet encrypted JSON"
+        BLOB payload "AES-GCM encrypted JSON"
         TEXT created_at
         TEXT updated_at
         TEXT last_played_at
@@ -135,12 +135,12 @@ erDiagram
 
     SETTINGS {
         TEXT key PK
-        BLOB payload "Fernet encrypted JSON"
+        BLOB payload "AES-GCM encrypted JSON"
         TEXT updated_at
     }
 ```
 
-The `streams.payload` blob contains the encrypted JSON for URL, title, quality, and volume. The `settings.payload` blob contains encrypted app settings such as Twitch chat username and OAuth token. Timestamp and play-count fields stay outside encrypted payloads so the app can sort history without decrypting every metadata field into separate columns.
+The `streams.payload` blob contains the encrypted JSON for URL, title, quality, and volume. The `settings.payload` blob contains encrypted app settings such as Twitch app credentials and OAuth tokens. Timestamp and play-count fields stay outside encrypted payloads so the app can sort history without decrypting every metadata field into separate columns.
 
 ## Volume Flow
 
@@ -170,6 +170,7 @@ stateDiagram-v2
 `requirements.txt` currently pins:
 
 ```txt
+bleach==6.1.0
 customtkinter==5.2.2
 cryptography==42.0.0
 streamlink==6.8.0
@@ -178,6 +179,7 @@ streamlink==6.8.0
 The package metadata in `pyproject.toml` uses compatible minimum versions for distribution:
 
 ```txt
+bleach>=6.1.0
 customtkinter>=5.2.2
 cryptography>=42.0.0
 streamlink>=6.8.0
@@ -335,8 +337,8 @@ twitchaudio
 1. Launch the app with `twitchaudio`.
 2. Enter or create your history vault password.
 3. Paste a Twitch stream URL, or click `Use BeardHero`.
-4. Keep quality on `audio_only`.
-5. Click `Start Audio`.
+4. Keep playback on `Audio only`, or choose `Low-bandwidth video` and select `160p` or `360p`.
+5. Click `Start Audio` or `Start Low Video`.
 6. Move the volume slider if needed.
 7. Use `Play`, `Load`, or `Delete` on saved history cards.
 8. Use `Connect` in the Twitch Chat panel if you configured chat auth, or `Open Popout` for browser chat.
@@ -348,24 +350,24 @@ TwitchAudio supports chat in two ways:
 
 | Mode | Setup | Notes |
 | --- | --- | --- |
-| In-app chat | Open `Settings` and save your Twitch username plus OAuth token. | Chat appears inside the GUI and can send messages. |
+| In-app chat | Open `Settings`, save your Twitch Client ID and Client Secret, then generate a token. | Chat appears inside the GUI and can send messages. |
 | Browser popout | Click `Open Popout`. | Opens Twitch chat in your default browser and does not need app chat auth. |
 
-For in-app chat, create a Twitch user OAuth token with these scopes:
+For in-app chat, create a Twitch application and copy its Client ID and Client Secret into `Settings`. TwitchAudio then starts Twitch's device-code flow and asks for these chat scopes:
 
 ```txt
-chat:read chat:write
+chat:read chat:edit
 ```
 
-Then open `Settings`, paste your Twitch username and token, and click `Save`. The token may include or omit the `oauth:` prefix. TwitchAudio adds it if needed.
+Click `Generate Token`, open the displayed Twitch activation URL on any browser-capable device, and enter the displayed code. TwitchAudio stores the resulting access token and refresh token encrypted, then refreshes access automatically before connecting chat.
 
-Twitch chat settings are encrypted in the same local vault used for stream history. They are not stored in environment variables.
+Twitch app credentials, OAuth tokens, refresh tokens, and transcripts are encrypted in the same local vault used for stream history. They are not stored in environment variables.
 
-The in-app chat client supports normal chat messages. It does not send moderation commands.
+The in-app chat client supports normal chat messages. It sanitizes incoming and outgoing text before display/storage, uses parameterized SQLite writes, and does not send moderation commands.
 
 ## How It Saves Streams
 
-When a stream starts, TwitchAudio creates a payload with the stream title, URL, quality, and volume. That payload is serialized to JSON, encrypted with Fernet, and stored in SQLite. The saved-stream card view decrypts records only after the vault is unlocked with the correct password.
+When a stream starts, TwitchAudio creates a payload with the stream title, URL, quality, and volume. That payload is serialized to JSON, sealed in a versioned AES-GCM envelope, and stored in SQLite. The saved-stream card view decrypts records only after the vault is unlocked with the correct password.
 
 The app trims history to the newest 80 saved records.
 
@@ -381,7 +383,7 @@ If an older `~/.twitchaudio` directory already exists, TwitchAudio keeps using i
 
 ## Bandwidth Notes
 
-TwitchAudio is locked to `audio_only`, so it does not accidentally request video variants.
+TwitchAudio defaults to `audio_only`. Optional video playback is deliberately locked to Streamlink's low variants: `160p` and `360p`. Higher qualities are not exposed in the UI and are rejected by the playback code.
 
 Typical Twitch audio-only usage is roughly 60-80 MB per hour. A 1080p stream can use multiple GB per hour. Actual bandwidth depends on Twitch's current stream variants and your network.
 
@@ -395,8 +397,12 @@ Encrypted:
 - Display title.
 - Quality setting.
 - Volume setting.
-- Twitch chat username.
-- Twitch chat OAuth token.
+- Twitch Client ID.
+- Twitch Client Secret.
+- Twitch login name.
+- Twitch OAuth access token.
+- Twitch OAuth refresh token.
+- Twitch chat message payloads.
 
 Still visible in SQLite:
 
@@ -410,9 +416,9 @@ Key details:
 
 - Passwords are not stored directly.
 - A random salt is generated for the vault.
-- Keys are derived with PBKDF2-HMAC-SHA256 using 600,000 iterations.
-- A short verifier token is encrypted to confirm whether the password can unlock the vault.
-- Changing the vault password re-encrypts saved stream payloads with a new password-derived key.
+- Keys are derived with Scrypt and used as raw AES-256-GCM keys.
+- A short verifier token is sealed with AES-GCM to confirm whether the password can unlock the vault.
+- Changing the vault password re-encrypts saved stream, settings, and chat payloads with a new password-derived key.
 
 If you need full-file encrypted SQLite, use SQLCipher or a platform-level encrypted filesystem. This project intentionally keeps setup simple by encrypting payloads in the app.
 
@@ -475,7 +481,7 @@ If volume changes cause a brief cutout, that is expected. TwitchAudio restarts `
 - `EncryptedHistoryStore`: SQLite schema, vault unlock, encryption, decryption, password rotation, history trimming.
 - `PasswordDialog`: first-run vault creation and later unlock dialog.
 - `PasswordChangeDialog`: vault password rotation UI.
-- `SettingsDialog`: encrypted Twitch chat username and OAuth token settings UI.
+- `SettingsDialog`: encrypted Twitch Client ID/Secret storage and device-code OAuth token UI.
 - `StreamCard`: saved-stream card UI.
 - `TwitchChatReader`: Twitch IRC reader and sender used by the in-app chat panel.
 - `TwitchAudioApp`: main window, Streamlink/ffplay process lifecycle, diagnostics, live volume debounce, history actions, settings, and chat actions.
