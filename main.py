@@ -26,6 +26,7 @@ try:
     from tkinter import BooleanVar, messagebox
 
     import customtkinter as ctk
+    from PIL import Image
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 except ModuleNotFoundError as exc:
@@ -45,6 +46,7 @@ except ModuleNotFoundError:
 
 APP_NAME = "TwitchAudio"
 DEFAULT_STREAM_URL = "https://www.twitch.tv/beardhero"
+LOGO_PATH = Path(__file__).resolve().parent / "logo.png"
 LEGACY_APP_DIR = Path.home() / ".twitchaudio"
 
 
@@ -1594,12 +1596,21 @@ class TwitchAudioApp(ctk.CTk):
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
 
+        self.logo_image: ctk.CTkImage | None = None
+        if LOGO_PATH.exists():
+            try:
+                raw_logo = Image.open(LOGO_PATH)
+                self.logo_image = ctk.CTkImage(light_image=raw_logo, dark_image=raw_logo, size=(235, 134))
+                ctk.CTkLabel(sidebar, image=self.logo_image, text="").pack(anchor="w", padx=24, pady=(20, 4))
+            except Exception as exc:
+                self.log(f"Logo could not be loaded: {exc}")
+
         ctk.CTkLabel(
             sidebar,
             text="TwitchAudio",
-            font=ctk.CTkFont(size=32, weight="bold"),
+            font=ctk.CTkFont(size=24, weight="bold"),
             text_color="#f6f8ff",
-        ).pack(anchor="w", padx=26, pady=(32, 2))
+        ).pack(anchor="w", padx=26, pady=(6 if self.logo_image else 32, 2))
         ctk.CTkLabel(
             sidebar,
             text="Audio-only command deck",
@@ -2173,10 +2184,12 @@ class TwitchAudioApp(ctk.CTk):
             "mpv",
             "--no-config",
             f"--wid={window_id}",
-            "--profile=low-latency",
-            "--cache=no",
+            "--cache=yes",
+            "--cache-secs=4",
+            "--demuxer-readahead-secs=4",
             "--force-window=yes",
             "--vo=x11",
+            "--framedrop=vo",
             "--demuxer-lavf-format=mpegts",
             f"--volume={max(0, min(volume * 100, 300)):.0f}",
             "-",
@@ -2560,4 +2573,3 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         sys.exit(0)
-
