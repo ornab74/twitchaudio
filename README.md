@@ -126,7 +126,6 @@ sudo apt install -y alsa-utils
 customtkinter==5.2.2
 cryptography==42.0.0
 streamlink==6.8.0
-Pillow
 ```
 
 `bleach` is optional. When installed, it is used for stronger text sanitization. Without it, the app falls back to built-in HTML stripping.
