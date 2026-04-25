@@ -43,6 +43,11 @@ except ModuleNotFoundError as exc:
     sys.exit(1)
 
 try:
+    from PIL import Image
+except ModuleNotFoundError:
+    Image = None
+
+try:
     import bleach
 except ModuleNotFoundError:
     bleach = None
@@ -117,20 +122,154 @@ MAX_EVENTS_PER_TICK = 80
 PROCESS_MONITOR_INTERVAL_SECONDS = 3.0
 PROCESS_HEARTBEAT_SECONDS = 30.0
 DIAGNOSTIC_LOG_INTERVAL_SECONDS = 1.5
-VIDEO_READY_MESSAGE = "Video is ready. Choose Video mode and a resolution. Use Player Window for lower CPU, or double-click the in-app video for fullscreen."
+VIDEO_READY_MESSAGE = "Video is ready. Choose Video mode and a resolution. FFplay is used for audio and video playback; double-click the in-app video for fullscreen."
 TWITCH_CATEGORY_IDS = {
     "Software and Game Development": "1469308723",
+    "Software & Game Development": "1469308723",
     "Science & Technology": "509670",
     "Science and Technology": "509670",
+    "Science-and-Technology": "509670",
+    "science-and-technology": "509670",
     "Just Chatting": "509658",
     "Music": "26936",
     "Art": "509660",
     "Makers & Crafting": "509673",
+    "Makers and Crafting": "509673",
     "Food & Drink": "509667",
+    "Food and Drink": "509667",
     "Sports": "518203",
     "Talk Shows & Podcasts": "417752",
+    "Talk Shows and Podcasts": "417752",
     "Special Events": "509663",
 }
+TWITCH_CATEGORY_SLUGS = {
+    "Software and Game Development": "software-and-game-development",
+    "Software & Game Development": "software-and-game-development",
+    "Science & Technology": "science-and-technology",
+    "Science and Technology": "science-and-technology",
+    "Science-and-Technology": "science-and-technology",
+    "science-and-technology": "science-and-technology",
+    "Just Chatting": "just-chatting",
+    "Music": "music",
+    "Art": "art",
+    "Makers & Crafting": "makers-and-crafting",
+    "Makers and Crafting": "makers-and-crafting",
+    "Food & Drink": "food-and-drink",
+    "Food and Drink": "food-and-drink",
+    "Sports": "sports",
+    "Talk Shows & Podcasts": "talk-shows-and-podcasts",
+    "Talk Shows and Podcasts": "talk-shows-and-podcasts",
+    "Special Events": "special-events",
+}
+TWITCH_DIRECTORY_RESERVED_PATHS = {
+    "about",
+    "activate",
+    "bits",
+    "blog",
+    "creatorcamp",
+    "directory",
+    "downloads",
+    "jobs",
+    "login",
+    "p",
+    "payments",
+    "prime",
+    "products",
+    "settings",
+    "signup",
+    "store",
+    "subscriptions",
+    "team",
+    "turbo",
+    "videos",
+}
+SCIENCE_TECH_FALLBACK_QUERIES = (
+    "Science & Technology",
+    "Science and Technology",
+    "science-and-technology",
+    "science",
+    "technology",
+    "NASA",
+    "space",
+    "engineering",
+    "programming",
+)
+FFPLAY_DOCK_TIMEOUT_SECONDS = 5.0
+X11_CARDINAL_ATOM = 6
+X11_KEY_PRESS = 2
+X11_KEY_RELEASE = 3
+X11_KEY_PRESS_MASK = 1
+X11_KEY_RELEASE_MASK = 2
+X11_BUTTON_PRESS = 4
+X11_BUTTON_PRESS_MASK = 4
+X11_CURRENT_TIME = 0
+X11_REVERT_TO_PARENT = 2
+_X11_LIBRARY: ctypes.CDLL | None = None
+_X11_LIBRARY_CHECKED = False
+
+
+class XKeyEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("x_root", ctypes.c_int),
+        ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint),
+        ("keycode", ctypes.c_uint),
+        ("same_screen", ctypes.c_int),
+    ]
+
+
+class XButtonEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("serial", ctypes.c_ulong),
+        ("send_event", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("window", ctypes.c_ulong),
+        ("root", ctypes.c_ulong),
+        ("subwindow", ctypes.c_ulong),
+        ("time", ctypes.c_ulong),
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("x_root", ctypes.c_int),
+        ("y_root", ctypes.c_int),
+        ("state", ctypes.c_uint),
+        ("button", ctypes.c_uint),
+        ("same_screen", ctypes.c_int),
+    ]
+
+
+class XEvent(ctypes.Union):
+    _fields_ = [("type", ctypes.c_int), ("xbutton", XButtonEvent), ("pad", ctypes.c_long * 24)]
+
+
+class XErrorEvent(ctypes.Structure):
+    _fields_ = [
+        ("type", ctypes.c_int),
+        ("display", ctypes.c_void_p),
+        ("resourceid", ctypes.c_ulong),
+        ("serial", ctypes.c_ulong),
+        ("error_code", ctypes.c_ubyte),
+        ("request_code", ctypes.c_ubyte),
+        ("minor_code", ctypes.c_ubyte),
+    ]
+
+
+X11_ERROR_HANDLER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(XErrorEvent))
+_X11_ERROR_HANDLER_REF: Any | None = None
+
+
+def _x11_ignore_error(_display: ctypes.c_void_p, _event: ctypes.POINTER(XErrorEvent)) -> int:
+    return 0
 
 
 def sanitize_text(value: Any, max_chars: int = 500) -> str:
@@ -185,6 +324,427 @@ def twitch_channel_from_url(url: str) -> str | None:
     if re.fullmatch(r"[a-z0-9_]{3,25}", candidate):
         return candidate
     return None
+
+
+def _load_x11() -> ctypes.CDLL | None:
+    global _X11_LIBRARY, _X11_LIBRARY_CHECKED
+    if _X11_LIBRARY_CHECKED:
+        return _X11_LIBRARY
+
+    _X11_LIBRARY_CHECKED = True
+    path = ctypes.util.find_library("X11") or "libX11.so.6"
+    try:
+        x11 = ctypes.CDLL(path)
+    except OSError:
+        return None
+
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    x11.XCloseDisplay.restype = ctypes.c_int
+    x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    x11.XInternAtom.restype = ctypes.c_ulong
+    x11.XGetWindowProperty.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_long,
+        ctypes.c_long,
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ubyte)),
+    ]
+    x11.XGetWindowProperty.restype = ctypes.c_int
+    x11.XQueryTree.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.POINTER(ctypes.c_ulong)),
+        ctypes.POINTER(ctypes.c_uint),
+    ]
+    x11.XQueryTree.restype = ctypes.c_int
+    x11.XFetchName.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.POINTER(ctypes.c_char_p)]
+    x11.XFetchName.restype = ctypes.c_int
+    x11.XReparentWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_int]
+    x11.XReparentWindow.restype = ctypes.c_int
+    x11.XMoveResizeWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
+    x11.XMoveResizeWindow.restype = ctypes.c_int
+    x11.XSetWindowBorderWidth.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_uint]
+    x11.XSetWindowBorderWidth.restype = ctypes.c_int
+    x11.XMapWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x11.XMapWindow.restype = ctypes.c_int
+    x11.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x11.XRaiseWindow.restype = ctypes.c_int
+    x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+    x11.XDefaultScreen.restype = ctypes.c_int
+    x11.XDisplayWidth.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDisplayWidth.restype = ctypes.c_int
+    x11.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDisplayHeight.restype = ctypes.c_int
+    x11.XFlush.argtypes = [ctypes.c_void_p]
+    x11.XFlush.restype = ctypes.c_int
+    x11.XFree.argtypes = [ctypes.c_void_p]
+    x11.XFree.restype = ctypes.c_int
+    x11.XSetErrorHandler.argtypes = [X11_ERROR_HANDLER]
+    x11.XSetErrorHandler.restype = X11_ERROR_HANDLER
+    x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XSync.restype = ctypes.c_int
+    global _X11_ERROR_HANDLER_REF
+    if _X11_ERROR_HANDLER_REF is None:
+        _X11_ERROR_HANDLER_REF = X11_ERROR_HANDLER(_x11_ignore_error)
+    x11.XSetErrorHandler(_X11_ERROR_HANDLER_REF)
+    x11.XStringToKeysym.argtypes = [ctypes.c_char_p]
+    x11.XStringToKeysym.restype = ctypes.c_ulong
+    x11.XKeysymToKeycode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x11.XKeysymToKeycode.restype = ctypes.c_uint
+    x11.XSetInputFocus.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    x11.XSetInputFocus.restype = ctypes.c_int
+    x11.XSendEvent.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_long, ctypes.c_void_p]
+    x11.XSendEvent.restype = ctypes.c_int
+    x11.XSelectInput.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_long]
+    x11.XSelectInput.restype = ctypes.c_int
+    x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.POINTER(XEvent)]
+    x11.XNextEvent.restype = ctypes.c_int
+    x11.XQueryPointer.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_uint),
+    ]
+    x11.XQueryPointer.restype = ctypes.c_int
+    x11.XGetGeometry.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.POINTER(ctypes.c_ulong),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_uint),
+    ]
+    x11.XGetGeometry.restype = ctypes.c_int
+    _X11_LIBRARY = x11
+    return x11
+
+
+def _x11_window_pid(x11: ctypes.CDLL, display: ctypes.c_void_p, window: int, pid_atom: int) -> int | None:
+    if not window:
+        return None
+    actual_type = ctypes.c_ulong()
+    actual_format = ctypes.c_int()
+    nitems = ctypes.c_ulong()
+    bytes_after = ctypes.c_ulong()
+    prop = ctypes.POINTER(ctypes.c_ubyte)()
+    status = x11.XGetWindowProperty(
+        display,
+        ctypes.c_ulong(window),
+        ctypes.c_ulong(pid_atom),
+        0,
+        1,
+        0,
+        X11_CARDINAL_ATOM,
+        ctypes.byref(actual_type),
+        ctypes.byref(actual_format),
+        ctypes.byref(nitems),
+        ctypes.byref(bytes_after),
+        ctypes.byref(prop),
+    )
+    try:
+        x11.XSync(display, 0)
+    except Exception:
+        pass
+    if status != 0 or not prop:
+        return None
+    try:
+        if nitems.value < 1 or actual_format.value != 32:
+            return None
+        return int(ctypes.cast(prop, ctypes.POINTER(ctypes.c_ulong))[0])
+    finally:
+        x11.XFree(ctypes.cast(prop, ctypes.c_void_p))
+
+
+def _x11_window_title(x11: ctypes.CDLL, display: ctypes.c_void_p, window: int) -> str:
+    if not window:
+        return ""
+    name = ctypes.c_char_p()
+    fetched = x11.XFetchName(display, ctypes.c_ulong(window), ctypes.byref(name))
+    try:
+        x11.XSync(display, 0)
+    except Exception:
+        pass
+    if not fetched or not name.value:
+        return ""
+    try:
+        return name.value.decode("utf-8", errors="replace")
+    finally:
+        x11.XFree(ctypes.cast(name, ctypes.c_void_p))
+
+
+def _find_x11_window_for_ffplay(
+    x11: ctypes.CDLL,
+    display: ctypes.c_void_p,
+    root: int,
+    pid_atom: int,
+    pid: int,
+    title: str,
+) -> int | None:
+    stack = [root]
+    while stack:
+        window = stack.pop()
+        try:
+            matches_pid = bool(pid_atom) and _x11_window_pid(x11, display, window, pid_atom) == pid
+            matches_title = bool(title) and _x11_window_title(x11, display, window) == title
+        except Exception:
+            continue
+        if matches_pid or matches_title:
+            return window
+
+        root_return = ctypes.c_ulong()
+        parent_return = ctypes.c_ulong()
+        children = ctypes.POINTER(ctypes.c_ulong)()
+        nchildren = ctypes.c_uint()
+        if not x11.XQueryTree(
+            display,
+            ctypes.c_ulong(window),
+            ctypes.byref(root_return),
+            ctypes.byref(parent_return),
+            ctypes.byref(children),
+            ctypes.byref(nchildren),
+        ):
+            continue
+        try:
+            if children:
+                stack.extend(int(children[index]) for index in range(nchildren.value))
+        finally:
+            if children:
+                x11.XFree(ctypes.cast(children, ctypes.c_void_p))
+    return None
+
+
+def dock_x11_window_for_pid(pid: int, parent_window_id: int, width: int, height: int, title: str = "") -> int | None:
+    x11 = _load_x11()
+    if x11 is None:
+        return None
+    display = x11.XOpenDisplay(None)
+    if not display:
+        return None
+    try:
+        root = int(x11.XDefaultRootWindow(display))
+        pid_atom = int(x11.XInternAtom(display, b"_NET_WM_PID", 0))
+        deadline = time.time() + FFPLAY_DOCK_TIMEOUT_SECONDS
+        child_window: int | None = None
+        while time.time() < deadline:
+            child_window = _find_x11_window_for_ffplay(x11, display, root, pid_atom, pid, title)
+            if child_window:
+                break
+            time.sleep(0.1)
+        if not child_window:
+            return None
+        x11.XSetWindowBorderWidth(display, child_window, 0)
+        x11.XReparentWindow(display, child_window, parent_window_id, 0, 0)
+        x11.XMoveResizeWindow(display, child_window, 0, 0, max(width, 1), max(height, 1))
+        x11.XMapWindow(display, child_window)
+        x11.XFlush(display)
+        return child_window
+    finally:
+        x11.XCloseDisplay(display)
+
+
+def resize_x11_window(window_id: int, width: int, height: int) -> bool:
+    x11 = _load_x11()
+    if x11 is None:
+        return False
+    display = x11.XOpenDisplay(None)
+    if not display:
+        return False
+    try:
+        x11.XMoveResizeWindow(display, window_id, 0, 0, max(width, 1), max(height, 1))
+        x11.XFlush(display)
+        return True
+    finally:
+        x11.XCloseDisplay(display)
+
+
+def reparent_x11_window(window_id: int, parent_window_id: int, width: int, height: int, x: int = 0, y: int = 0, raise_window: bool = False) -> bool:
+    x11 = _load_x11()
+    if x11 is None or not window_id or not parent_window_id:
+        return False
+    display = x11.XOpenDisplay(None)
+    if not display:
+        return False
+    try:
+        x11.XReparentWindow(display, ctypes.c_ulong(window_id), ctypes.c_ulong(parent_window_id), int(x), int(y))
+        x11.XMoveResizeWindow(display, ctypes.c_ulong(window_id), int(x), int(y), max(int(width), 1), max(int(height), 1))
+        x11.XMapWindow(display, ctypes.c_ulong(window_id))
+        if raise_window:
+            x11.XRaiseWindow(display, ctypes.c_ulong(window_id))
+        x11.XFlush(display)
+        try:
+            x11.XSync(display, 0)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+    finally:
+        x11.XCloseDisplay(display)
+
+
+def fullscreen_x11_window(window_id: int) -> bool:
+    x11 = _load_x11()
+    if x11 is None or not window_id:
+        return False
+    display = x11.XOpenDisplay(None)
+    if not display:
+        return False
+    try:
+        root = int(x11.XDefaultRootWindow(display))
+        screen = int(x11.XDefaultScreen(display))
+        width = int(x11.XDisplayWidth(display, screen))
+        height = int(x11.XDisplayHeight(display, screen))
+        if width <= 0 or height <= 0:
+            return False
+        x11.XSetWindowBorderWidth(display, ctypes.c_ulong(window_id), 0)
+        x11.XReparentWindow(display, ctypes.c_ulong(window_id), ctypes.c_ulong(root), 0, 0)
+        x11.XMoveResizeWindow(display, ctypes.c_ulong(window_id), 0, 0, width, height)
+        x11.XMapWindow(display, ctypes.c_ulong(window_id))
+        x11.XRaiseWindow(display, ctypes.c_ulong(window_id))
+        x11.XFlush(display)
+        try:
+            x11.XSync(display, 0)
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+    finally:
+        x11.XCloseDisplay(display)
+
+
+def send_x11_key_to_window(window_id: int, key: str = "f") -> bool:
+    x11 = _load_x11()
+    if x11 is None:
+        return False
+    display = x11.XOpenDisplay(None)
+    if not display:
+        return False
+    try:
+        keysym = int(x11.XStringToKeysym(key.encode("ascii", errors="ignore")))
+        if not keysym:
+            return False
+        keycode = int(x11.XKeysymToKeycode(display, ctypes.c_ulong(keysym)))
+        if not keycode:
+            return False
+        root = int(x11.XDefaultRootWindow(display))
+        x11.XSetInputFocus(display, ctypes.c_ulong(window_id), X11_REVERT_TO_PARENT, X11_CURRENT_TIME)
+        for event_type in (X11_KEY_PRESS, X11_KEY_RELEASE):
+            event = XKeyEvent()
+            event.type = event_type
+            event.display = display
+            event.window = int(window_id)
+            event.root = root
+            event.subwindow = 0
+            event.time = X11_CURRENT_TIME
+            event.x = 1
+            event.y = 1
+            event.x_root = 1
+            event.y_root = 1
+            event.state = 0
+            event.keycode = keycode
+            event.same_screen = 1
+            x11.XSendEvent(
+                display,
+                ctypes.c_ulong(window_id),
+                1,
+                X11_KEY_PRESS_MASK | X11_KEY_RELEASE_MASK,
+                ctypes.byref(event),
+            )
+        x11.XFlush(display)
+        return True
+    finally:
+        x11.XCloseDisplay(display)
+
+
+def watch_x11_double_click(window_id: int, on_double_click: Callable[[], None]) -> bool:
+    x11 = _load_x11()
+    if x11 is None:
+        return False
+    display = x11.XOpenDisplay(None)
+    if not display:
+        return False
+
+    try:
+        last_click_at = 0.0
+        was_down = False
+        while True:
+            root_return = ctypes.c_ulong()
+            child_return = ctypes.c_ulong()
+            root_x = ctypes.c_int()
+            root_y = ctypes.c_int()
+            win_x = ctypes.c_int()
+            win_y = ctypes.c_int()
+            mask = ctypes.c_uint()
+            if not x11.XQueryPointer(
+                display,
+                ctypes.c_ulong(window_id),
+                ctypes.byref(root_return),
+                ctypes.byref(child_return),
+                ctypes.byref(root_x),
+                ctypes.byref(root_y),
+                ctypes.byref(win_x),
+                ctypes.byref(win_y),
+                ctypes.byref(mask),
+            ):
+                return False
+
+            root = ctypes.c_ulong()
+            geom_x = ctypes.c_int()
+            geom_y = ctypes.c_int()
+            width = ctypes.c_uint()
+            height = ctypes.c_uint()
+            border_width = ctypes.c_uint()
+            depth = ctypes.c_uint()
+            if not x11.XGetGeometry(
+                display,
+                ctypes.c_ulong(window_id),
+                ctypes.byref(root),
+                ctypes.byref(geom_x),
+                ctypes.byref(geom_y),
+                ctypes.byref(width),
+                ctypes.byref(height),
+                ctypes.byref(border_width),
+                ctypes.byref(depth),
+            ):
+                return False
+
+            inside = 0 <= win_x.value < max(int(width.value), 1) and 0 <= win_y.value < max(int(height.value), 1)
+            down = inside and bool(mask.value & 0x1F00)
+            if down and not was_down:
+                now = time.time()
+                if now - last_click_at <= 0.45:
+                    last_click_at = 0.0
+                    on_double_click()
+                else:
+                    last_click_at = now
+            was_down = down
+            time.sleep(0.025)
+    except Exception:
+        return False
+    finally:
+        x11.XCloseDisplay(display)
 
 
 def looks_like_url(url: str) -> bool:
@@ -883,54 +1443,237 @@ class TwitchOAuthManager:
                     online.add(sanitize_chat_user(str(item["user_login"]).lower()))
         return online
 
-    def get_category_streams(self, category: str, limit: int = 30) -> list[dict[str, str]]:
+    def _category_query_aliases(self, category: str) -> list[str]:
         category = sanitize_text(category, max_chars=80)
-        category_id = ""
-        games = self.helix_get("/games", [("name", category)])
-        for item in games.get("data", []):
-            if not isinstance(item, dict):
-                continue
-            name = sanitize_text(item.get("name"), max_chars=80)
-            if name.lower() == category.lower():
-                category_id = str(item.get("id") or "")
-                break
-        if not category_id:
-            category_id = TWITCH_CATEGORY_IDS.get(category, "")
-        if not category_id:
-            query = "Science & Technology" if category.lower() == "science and technology" else category
-            search = self.helix_get("/search/categories", [("query", query), ("first", "10")])
+        aliases = [category]
+
+        def add_alias(value: str) -> None:
+            alias = sanitize_text(value, max_chars=80)
+            if alias and alias.lower() not in {item.lower() for item in aliases}:
+                aliases.append(alias)
+
+        add_alias(category.replace(" and ", " & "))
+        add_alias(category.replace(" & ", " and "))
+        add_alias(category.replace("-and-", " & ").replace("-", " ").title())
+        slug = TWITCH_CATEGORY_SLUGS.get(category) or self._category_slug_from_name(category)
+        add_alias(slug)
+        add_alias(slug.replace("-", " ").title())
+        if category.lower().replace("&", "and").replace("-", " ") in {"science and technology", "science and technology"} or slug == "science-and-technology":
+            for alias in ("Science & Technology", "Science and Technology", "science-and-technology"):
+                add_alias(alias)
+        return aliases
+
+    def _category_slug_from_name(self, category: str) -> str:
+        slug = category.strip().lower().replace("&", "and")
+        slug = re.sub(r"[^a-z0-9]+", "-", slug).strip("-")
+        return slug
+
+    def _category_slug_candidates(self, category: str) -> list[str]:
+        slugs: list[str] = []
+
+        def add_slug(value: Any) -> None:
+            slug = sanitize_text(value, max_chars=100).lower()
+            slug = re.sub(r"[^a-z0-9-]+", "-", slug).strip("-")
+            if slug and slug not in slugs:
+                slugs.append(slug)
+
+        for alias in self._category_query_aliases(category):
+            add_slug(TWITCH_CATEGORY_SLUGS.get(alias, ""))
+            add_slug(alias if "-" in alias else self._category_slug_from_name(alias))
+        return slugs
+
+    def _category_id_candidates(self, category: str) -> list[str]:
+        category = sanitize_text(category, max_chars=80)
+        aliases = self._category_query_aliases(category)
+        candidates: list[str] = []
+
+        def add_candidate(value: Any) -> None:
+            candidate = str(value or "").strip()
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
+
+        for alias in aliases:
+            add_candidate(TWITCH_CATEGORY_IDS.get(alias, ""))
+
+        for alias in aliases:
+            games = self.helix_get("/games", [("name", alias)])
+            for item in games.get("data", []):
+                if not isinstance(item, dict):
+                    continue
+                name = sanitize_text(item.get("name"), max_chars=80)
+                if name.lower() == alias.lower() or name.lower() == category.lower():
+                    add_candidate(item.get("id"))
+
+        for alias in aliases:
+            search = self.helix_get("/search/categories", [("query", alias), ("first", "20")])
             for item in search.get("data", []):
                 if not isinstance(item, dict):
                     continue
                 name = sanitize_text(item.get("name"), max_chars=80)
-                if name.lower() in {category.lower(), query.lower()}:
-                    category_id = str(item.get("id") or "")
-                    break
-            if not category_id and search.get("data"):
-                first = search["data"][0]
-                if isinstance(first, dict):
-                    category_id = str(first.get("id") or "")
-        if not category_id:
-            return []
+                if name.lower() in {candidate.lower() for candidate in aliases}:
+                    add_candidate(item.get("id"))
+            if not candidates:
+                for item in search.get("data", [])[:3]:
+                    if isinstance(item, dict):
+                        add_candidate(item.get("id"))
+        return candidates
 
+    def _stream_record_from_parts(self, login: Any, display_name: Any, title: Any) -> dict[str, str] | None:
+        clean_login = sanitize_chat_user(login)
+        if clean_login == "unknown":
+            return None
+        clean_display_name = sanitize_text(display_name, max_chars=80) or clean_login
+        return {
+            "login": clean_login,
+            "display_name": clean_display_name,
+            "title": sanitize_chat_message(title),
+            "url": f"https://www.twitch.tv/{clean_login}",
+        }
+
+    def _dedupe_streams(self, streams: list[dict[str, str]], limit: int) -> list[dict[str, str]]:
+        seen: set[str] = set()
+        unique: list[dict[str, str]] = []
+        for stream in streams:
+            login = stream.get("login", "")
+            if not login or login in seen:
+                continue
+            seen.add(login)
+            unique.append(stream)
+            if len(unique) >= max(1, min(limit, 100)):
+                break
+        return unique
+
+    def _streams_for_category_id(self, category_id: str, limit: int) -> list[dict[str, str]]:
         payload = self.helix_get("/streams", [("game_id", category_id), ("first", str(max(1, min(limit, 100))))])
         streams: list[dict[str, str]] = []
         for item in payload.get("data", []):
             if not isinstance(item, dict):
                 continue
-            login = sanitize_chat_user(item.get("user_login"))
-            title = sanitize_chat_message(item.get("title"))
-            display_name = sanitize_text(item.get("user_name"), max_chars=80) or login
-            if login != "unknown":
-                streams.append(
-                    {
-                        "login": login,
-                        "display_name": display_name,
-                        "title": title,
-                        "url": f"https://www.twitch.tv/{login}",
-                    }
-                )
+            record = self._stream_record_from_parts(item.get("user_login"), item.get("user_name"), item.get("title"))
+            if record:
+                streams.append(record)
         return streams
+
+    def _search_live_channels(self, queries: list[str], limit: int, category_aliases: list[str]) -> list[dict[str, str]]:
+        exact_matches: list[dict[str, str]] = []
+        loose_matches: list[dict[str, str]] = []
+        normalized_aliases = {alias.lower().replace("&", "and") for alias in category_aliases}
+        for query in queries:
+            search_query = sanitize_text(query, max_chars=80)
+            if not search_query:
+                continue
+            payload = self.helix_get(
+                "/search/channels",
+                [("query", search_query), ("live_only", "true"), ("first", "100")],
+            )
+            for item in payload.get("data", []):
+                if not isinstance(item, dict) or item.get("is_live") is False:
+                    continue
+                record = self._stream_record_from_parts(
+                    item.get("broadcaster_login"),
+                    item.get("display_name"),
+                    item.get("title"),
+                )
+                if not record:
+                    continue
+                game_name = sanitize_text(item.get("game_name"), max_chars=80).lower().replace("&", "and")
+                if game_name and game_name in normalized_aliases:
+                    exact_matches.append(record)
+                else:
+                    loose_matches.append(record)
+        return self._dedupe_streams([*exact_matches, *loose_matches], limit)
+
+    def _streams_for_channel_logins(self, logins: list[str], limit: int) -> list[dict[str, str]]:
+        clean_logins = []
+        for login in logins:
+            clean_login = sanitize_chat_user(login.lower())
+            if clean_login != "unknown" and clean_login not in clean_logins:
+                clean_logins.append(clean_login)
+        streams: list[dict[str, str]] = []
+        for index in range(0, min(len(clean_logins), 100), 100):
+            params = [("user_login", login) for login in clean_logins[index : index + 100]]
+            if not params:
+                continue
+            payload = self.helix_get("/streams", params)
+            for item in payload.get("data", []):
+                if not isinstance(item, dict):
+                    continue
+                record = self._stream_record_from_parts(item.get("user_login"), item.get("user_name"), item.get("title"))
+                if record:
+                    streams.append(record)
+        return self._dedupe_streams(streams, limit)
+
+    def _streams_from_directory_slug(self, slug: str, limit: int) -> list[dict[str, str]]:
+        slug = sanitize_text(slug, max_chars=100).lower()
+        slug = re.sub(r"[^a-z0-9-]+", "-", slug).strip("-")
+        if not slug:
+            return []
+        url = f"https://www.twitch.tv/directory/category/{urllib.parse.quote(slug)}"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 TwitchAudio/1.0",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                raw = response.read(2 * 1024 * 1024)
+        except Exception:
+            return []
+        page = html.unescape(raw.decode("utf-8", errors="replace"))
+        candidates: list[str] = []
+
+        def add_login(value: str) -> None:
+            login = sanitize_chat_user(value.lower())
+            if login == "unknown" or login in TWITCH_DIRECTORY_RESERVED_PATHS or login in candidates:
+                return
+            candidates.append(login)
+
+        for pattern in (
+            r'"broadcaster_login"\s*:\s*"([A-Za-z0-9_]{3,25})"',
+            r'"user_login"\s*:\s*"([A-Za-z0-9_]{3,25})"',
+            r'"login"\s*:\s*"([A-Za-z0-9_]{3,25})"',
+            r'href="/([A-Za-z0-9_]{3,25})(?:[/?#"]|$)',
+        ):
+            for match in re.finditer(pattern, page):
+                add_login(match.group(1))
+                if len(candidates) >= max(limit * 3, 30):
+                    break
+            if len(candidates) >= max(limit * 3, 30):
+                break
+
+        streams = self._streams_for_channel_logins(candidates, limit)
+        if streams:
+            return streams
+        fallback_streams: list[dict[str, str]] = []
+        for login in candidates[:limit]:
+            record = self._stream_record_from_parts(login, login, f"Live in {slug.replace('-', ' ').title()}")
+            if record:
+                fallback_streams.append(record)
+        return self._dedupe_streams(fallback_streams, limit)
+
+    def get_category_streams(self, category: str, limit: int = 30) -> list[dict[str, str]]:
+        clean_category = sanitize_text(category, max_chars=80)
+        category_aliases = self._category_query_aliases(clean_category)
+        all_streams: list[dict[str, str]] = []
+        for category_id in self._category_id_candidates(clean_category):
+            all_streams.extend(self._streams_for_category_id(category_id, limit))
+        streams = self._dedupe_streams(all_streams, limit)
+        if streams:
+            return streams
+
+        for slug in self._category_slug_candidates(clean_category):
+            streams = self._streams_from_directory_slug(slug, limit)
+            if streams:
+                return streams
+
+        fallback_queries = list(category_aliases)
+        normalized_category = clean_category.lower().replace("&", "and").replace("-", " ")
+        if normalized_category == "science and technology" or "science-and-technology" in category_aliases:
+            fallback_queries.extend(SCIENCE_TECH_FALLBACK_QUERIES)
+        return self._search_live_channels(fallback_queries, limit, category_aliases)
 
     def get_top_categories(self, limit: int = 60) -> list[str]:
         payload = self.helix_get("/games/top", [("first", str(max(1, min(limit, 100))))])
@@ -1753,6 +2496,9 @@ class TwitchAudioApp(ctk.CTk):
         self.embedded_video_process: subprocess.Popen[bytes] | None = None
         self.video_stream_process: subprocess.Popen[bytes] | None = None
         self.video_play_process: subprocess.Popen[bytes] | None = None
+        self.docked_video_window_id: int | None = None
+        self.ffplay_video_fullscreen = False
+        self.ffplay_dock_parent_id: int | None = None
         self.event_queue: queue.Queue[tuple[str, str]] = queue.Queue()
         self.chat_thread: threading.Thread | None = None
         self.chat_stop_event: threading.Event | None = None
@@ -1804,12 +2550,14 @@ class TwitchAudioApp(ctk.CTk):
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
 
-        self.logo_image: PhotoImage | None = None
-        if LOGO_PATH.exists():
+        self.logo_image: Any | None = None
+        if LOGO_PATH.exists() and Image is not None:
             try:
-                raw_logo = PhotoImage(file=str(LOGO_PATH))
-                scale = max(raw_logo.width() // 235, raw_logo.height() // 134, 1)
-                self.logo_image = raw_logo.subsample(scale, scale)
+                raw_logo = Image.open(LOGO_PATH)
+                width, height = raw_logo.size
+                scale = min(235 / max(width, 1), 134 / max(height, 1), 1.0)
+                display_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+                self.logo_image = ctk.CTkImage(light_image=raw_logo, dark_image=raw_logo, size=display_size)
                 ctk.CTkLabel(sidebar, image=self.logo_image, text="").pack(anchor="w", padx=24, pady=(20, 4))
             except Exception as exc:
                 self.log(f"Logo could not be loaded: {exc}")
@@ -2016,32 +2764,27 @@ class TwitchAudioApp(ctk.CTk):
         self.video_status_label.grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 6))
         self.video_surface = ctk.CTkFrame(video_panel, fg_color="#000000", corner_radius=8)
         self.video_surface.grid(row=1, column=0, sticky="nsew", padx=16, pady=(0, 10))
-        self.video_surface.bind("<Double-Button-1>", self.toggle_embedded_fullscreen)
+        self.video_surface.bind("<Double-Button-1>", self.toggle_ffplay_fullscreen)
+        self.video_surface.bind("<Configure>", self.resize_docked_video)
         video_placeholder = ctk.CTkLabel(
             self.video_surface,
-            text="Double-click for fullscreen",
+            text="Double-click video for fullscreen",
             text_color="#6f7a92",
         )
         video_placeholder.pack(expand=True)
-        video_placeholder.bind("<Double-Button-1>", self.toggle_embedded_fullscreen)
+        video_placeholder.bind("<Double-Button-1>", self.toggle_ffplay_fullscreen)
         self.video_hint_label = ctk.CTkLabel(
             video_panel,
-            text="Start Video embeds here with mpv. Player Window uses streamlink with a separate ffplay window.",
+            text="Start Video uses FFplay by default. On X11 it docks into this panel; double-click the video to toggle FFplay fullscreen.",
             font=ctk.CTkFont(size=12),
             text_color="#6f7a92",
             wraplength=640,
             justify="left",
         )
         self.video_hint_label.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
-        self.pop_video_button = ctk.CTkButton(
-            video_panel,
-            text="Start Player Window",
-            height=40,
-            fg_color="#26304a",
-            hover_color="#34405f",
-            command=self.toggle_video_popout,
-        )
-        self.pop_video_button.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
+        # The separate FFplay Dock button was removed. Video starts from the main Start Video button,
+        # and fullscreen is controlled by double-clicking the video area.
+        self.pop_video_button = None
         self.stream_health_label = ctk.CTkLabel(
             video_shell,
             text="Health: Idle",
@@ -2442,10 +3185,12 @@ class TwitchAudioApp(ctk.CTk):
             "-",
         ]
 
-    def _ffplay_video_command(self, volume: float) -> list[str]:
+    def _ffplay_video_command(self, volume: float, window_title: str) -> list[str]:
         return [
             "ffplay",
             "-autoexit",
+            "-window_title",
+            window_title,
             "-f",
             "mpegts",
             "-af",
@@ -2457,38 +3202,8 @@ class TwitchAudioApp(ctk.CTk):
             "-",
         ]
 
-    def _embedded_mpv_command(self, volume: float) -> list[str]:
-        self.update_idletasks()
-        window_id = str(self.video_surface.winfo_id())
-        return [
-            "mpv",
-            "--no-config",
-            f"--wid={window_id}",
-            "--cache=yes",
-            f"--cache-secs={VIDEO_CACHE_SECONDS}",
-            f"--demuxer-readahead-secs={VIDEO_CACHE_SECONDS}",
-            "--demuxer-max-bytes=512MiB",
-            "--demuxer-max-back-bytes=128MiB",
-            "--vd-lavc-threads=4",
-            "--vd-lavc-fast=yes",
-            "--vd-lavc-skiploopfilter=nonref",
-            "--force-window=yes",
-            "--vo=x11",
-            "--hwdec=auto-safe",
-            "--framedrop=decoder+vo",
-            "--osc=no",
-            "--osd-level=0",
-            "--audio-display=no",
-            "--sws-fast=yes",
-            "--sws-scaler=fast-bilinear",
-            "--untimed=no",
-            "--video-sync=display-resample",
-            "--input-default-bindings=no",
-            "--input-vo-keyboard=no",
-            "--demuxer-lavf-format=mpegts",
-            f"--volume={max(0, min(volume * 100, 300)):.0f}",
-            "-",
-        ]
+    def _embedded_ffplay_command(self, volume: float, window_title: str) -> list[str]:
+        return self._ffplay_video_command(volume, window_title)
 
     def _start_stderr_drain(self, process: subprocess.Popen[bytes] | None, name: str) -> None:
         if process is None or process.stderr is None:
@@ -2528,6 +3243,136 @@ class TwitchAudioApp(ctk.CTk):
             return ""
         return raw.decode("utf-8", errors="replace").strip()[-1200:]
 
+    def resize_docked_video(self, _event: object | None = None) -> None:
+        if self.docked_video_window_id is None or self.ffplay_video_fullscreen:
+            return
+        resize_x11_window(
+            self.docked_video_window_id,
+            self.video_surface.winfo_width(),
+            self.video_surface.winfo_height(),
+        )
+
+    def _dock_ffplay_player(
+        self,
+        process: subprocess.Popen[bytes],
+        parent_window_id: int,
+        width: int,
+        height: int,
+        window_title: str,
+    ) -> None:
+        window_id = dock_x11_window_for_pid(process.pid, parent_window_id, width, height, window_title)
+
+        def finish() -> None:
+            if self.video_play_process is not process or not self.is_video_popped:
+                return
+            if window_id is None:
+                self.video_status_label.configure(
+                    text="FFplay started in its own window. X11 docking was unavailable.",
+                    text_color="#ffb86c",
+                )
+                self.log("FFplay docking unavailable; using external player window.")
+                return
+            self.docked_video_window_id = window_id
+            self.ffplay_dock_parent_id = parent_window_id
+            self.ffplay_video_fullscreen = False
+            self._start_ffplay_double_click_watcher(window_id)
+            self.resize_docked_video()
+            self.video_status_label.configure(text="FFplay docked in app. Double-click the video area to toggle FFplay fullscreen.", text_color="#a7b0c8")
+            self.log("Docked ffplay into the video panel.")
+
+        self.after(0, finish)
+
+    def _dock_embedded_ffplay_player(
+        self,
+        process: subprocess.Popen[bytes],
+        parent_window_id: int,
+        width: int,
+        height: int,
+        window_title: str,
+    ) -> None:
+        window_id = dock_x11_window_for_pid(process.pid, parent_window_id, width, height, window_title)
+
+        def finish() -> None:
+            if self.embedded_video_process is not process or not self.is_streaming:
+                return
+            if window_id is None:
+                self.video_status_label.configure(
+                    text="FFplay started in its own window. X11 docking was unavailable.",
+                    text_color="#ffb86c",
+                )
+                self.log("FFplay docking unavailable; using external player window.")
+                return
+            self.docked_video_window_id = window_id
+            self.ffplay_dock_parent_id = parent_window_id
+            self.ffplay_video_fullscreen = False
+            self._start_ffplay_double_click_watcher(window_id)
+            self.resize_docked_video()
+            self.video_status_label.configure(text="FFplay docked in app. Double-click the video area to toggle FFplay fullscreen.", text_color="#a7b0c8")
+            self.log("Docked ffplay into the video panel.")
+
+        self.after(0, finish)
+
+    def _start_ffplay_double_click_watcher(self, window_id: int) -> None:
+        def on_double_click() -> None:
+            self.after(0, self.toggle_ffplay_fullscreen)
+
+        threading.Thread(
+            target=watch_x11_double_click,
+            args=(window_id, on_double_click),
+            daemon=True,
+        ).start()
+
+
+    def toggle_ffplay_fullscreen(self, _event: object | None = None) -> None:
+        if self.docked_video_window_id is None:
+            if not self.is_streaming and not self.is_video_popped:
+                self.video_status_label.configure(
+                    text="Start Video first, then double-click the video to toggle FFplay fullscreen.",
+                    text_color="#ffb86c",
+                )
+                self.log("FFplay fullscreen requested before video was started.")
+                return
+            self.video_status_label.configure(
+                text="FFplay is still attaching. Once the video appears, double-click the video area again.",
+                text_color="#ffb86c",
+            )
+            self.log("FFplay fullscreen request ignored because no docked FFplay window is available yet.")
+            return
+
+        if self.ffplay_video_fullscreen:
+            dock_parent = int(self.video_surface.winfo_id())
+            self.ffplay_dock_parent_id = dock_parent
+            if reparent_x11_window(
+                self.docked_video_window_id,
+                dock_parent,
+                self.video_surface.winfo_width(),
+                self.video_surface.winfo_height(),
+            ):
+                self.ffplay_video_fullscreen = False
+                self.video_status_label.configure(text="FFplay returned to the app. Double-click the video to fullscreen.", text_color="#a7b0c8")
+                self.log("Returned FFplay window from fullscreen to the dock.")
+                return
+            self.video_status_label.configure(text="Could not return FFplay to the dock. Press F in the FFplay window or restart video.", text_color="#ffb86c")
+            self.log("Could not re-dock FFplay window from fullscreen.")
+            return
+
+        if fullscreen_x11_window(self.docked_video_window_id):
+            self.ffplay_video_fullscreen = True
+            self.video_status_label.configure(text="FFplay video is fullscreen. Double-click the video again to return it to the app.", text_color="#a7b0c8")
+            self.log("Moved FFplay video window to fullscreen.")
+            return
+
+        if send_x11_key_to_window(self.docked_video_window_id, "f"):
+            self.video_status_label.configure(text="Sent fullscreen toggle to FFplay. Double-click again to exit.", text_color="#a7b0c8")
+            self.log("Sent fullscreen toggle to FFplay window.")
+            return
+        self.video_status_label.configure(
+            text="Could not toggle FFplay fullscreen. Click the FFplay video and press F.",
+            text_color="#ffb86c",
+        )
+        self.log("Could not toggle FFplay fullscreen.")
+
+
     def toggle_embedded_fullscreen(self, _event: object | None = None) -> None:
         if self.fullscreen_video:
             self.exit_embedded_fullscreen()
@@ -2555,7 +3400,8 @@ class TwitchAudioApp(ctk.CTk):
             self.video_title_label.grid_remove()
             self.video_status_label.grid_remove()
             self.video_hint_label.grid_remove()
-            self.pop_video_button.grid_remove()
+            if self.pop_video_button is not None:
+                self.pop_video_button.grid_remove()
             self.stream_health_label.grid_remove()
 
             self.main.grid_configure(row=0, column=0, columnspan=2, sticky="nsew", padx=0, pady=0)
@@ -2595,7 +3441,8 @@ class TwitchAudioApp(ctk.CTk):
             self.video_surface.grid_configure(row=1, column=0, sticky="nsew", padx=16, pady=(0, 10))
             self.video_surface.configure(corner_radius=8)
             self.video_hint_label.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 8))
-            self.pop_video_button.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
+            if self.pop_video_button is not None:
+                self.pop_video_button.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
             self.stream_health_label.grid(row=2, column=0, sticky="ew", padx=22, pady=(0, 16))
             self.side_stack.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
             self.sidebar.grid(row=0, column=0, sticky="nsew")
@@ -2651,7 +3498,7 @@ class TwitchAudioApp(ctk.CTk):
             messagebox.showerror("Unsafe quality", "Use audio_only in Audio mode, or choose a listed resolution in Video mode.")
             return False
 
-        required_tools = ("streamlink", "mpv") if video_mode else ("streamlink", "ffplay")
+        required_tools = ("streamlink", "ffplay")
         missing = [tool for tool in required_tools if shutil.which(tool) is None]
         if missing:
             messagebox.showerror(
@@ -2664,8 +3511,8 @@ class TwitchAudioApp(ctk.CTk):
         try:
             if video_mode:
                 self._start_embedded_video_pipe(url, quality, volume)
-                self.video_status_label.configure(text=f"Playing in app: {channel_name_from_url(url)} at {quality}")
-                self.set_stream_health("Healthy", f"{quality} buffer {VIDEO_CACHE_SECONDS}s")
+                self.video_status_label.configure(text=f"Starting FFplay: {channel_name_from_url(url)} at {quality}")
+                self.set_stream_health("Healthy", "ffplay")
             else:
                 self.stream_process = subprocess.Popen(
                     self._streamlink_command(url, quality),
@@ -2717,14 +3564,24 @@ class TwitchAudioApp(ctk.CTk):
         self._start_stderr_drain(self.stream_process, "streamlink")
         if self.stream_process.stdout is None:
             raise RuntimeError("streamlink did not provide a video pipe.")
+        self.update_idletasks()
+        parent_window_id = int(self.video_surface.winfo_id())
+        dock_width = max(self.video_surface.winfo_width(), 1)
+        dock_height = max(self.video_surface.winfo_height(), 1)
+        window_title = f"TwitchAudio FFplay {os.getpid()} {int(time.time() * 1000)}"
         self.embedded_video_process = subprocess.Popen(
-            self._embedded_mpv_command(volume),
+            self._embedded_ffplay_command(volume, window_title),
             stdin=self.stream_process.stdout,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
-        self._start_stderr_drain(self.embedded_video_process, "mpv")
+        self._start_stderr_drain(self.embedded_video_process, "ffplay-video")
         self.stream_process.stdout.close()
+        threading.Thread(
+            target=self._dock_embedded_ffplay_player,
+            args=(self.embedded_video_process, parent_window_id, dock_width, dock_height, window_title),
+            daemon=True,
+        ).start()
 
     def _cleanup_video_pipe(self) -> None:
         processes = [self.embedded_video_process, self.stream_process]
@@ -2740,6 +3597,9 @@ class TwitchAudioApp(ctk.CTk):
                     process.kill()
         self.embedded_video_process = None
         self.stream_process = None
+        self.docked_video_window_id = None
+        self.ffplay_video_fullscreen = False
+        self.ffplay_dock_parent_id = None
 
     def toggle_video_popout(self) -> None:
         if self.is_video_popped:
@@ -2767,6 +3627,12 @@ class TwitchAudioApp(ctk.CTk):
         if self.is_streaming:
             self.stop_stream(user_requested=False)
 
+        self.update_idletasks()
+        parent_window_id = int(self.video_surface.winfo_id())
+        dock_width = max(self.video_surface.winfo_width(), 1)
+        dock_height = max(self.video_surface.winfo_height(), 1)
+        window_title = f"TwitchFreedom FFplay {os.getpid()} {int(time.time() * 1000)}"
+
         try:
             self.video_stream_process = subprocess.Popen(
                 self._streamlink_command(url, quality),
@@ -2776,7 +3642,7 @@ class TwitchAudioApp(ctk.CTk):
             if self.video_stream_process.stdout is None:
                 raise RuntimeError("streamlink did not provide a video pipe.")
             self.video_play_process = subprocess.Popen(
-                self._ffplay_video_command(volume),
+                self._ffplay_video_command(volume, window_title),
                 stdin=self.video_stream_process.stdout,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -2784,25 +3650,34 @@ class TwitchAudioApp(ctk.CTk):
             self.video_stream_process.stdout.close()
         except Exception as exc:
             self.stop_video_popout(user_requested=False)
-            messagebox.showerror("Could not start player window", str(exc))
-            self.log(f"Player window failed: {exc}")
+            messagebox.showerror("Could not start FFplay Dock", str(exc))
+            self.log(f"FFplay Dock failed: {exc}")
             return False
 
         self.history.save_launch(url, quality, volume, playback_mode=PLAYBACK_LOW_VIDEO)
         self.refresh_history(check_online=False)
         self.is_video_popped = True
-        self.pop_video_button.configure(text="Stop Player Window")
+        if self.pop_video_button is not None:
+            self.pop_video_button.configure(text="Stop FFplay Dock")
         self.status_label.configure(text="Streaming", text_color="#72f2c7")
         self.now_playing_label.configure(text=f"{channel_name_from_url(url)} using {quality}")
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
-        self.video_status_label.configure(text=f"Playing in player window: {channel_name_from_url(url)} at {quality}", text_color="#a7b0c8")
-        self.set_stream_health("Healthy", "player window")
-        self.log(f"Started player window {quality}: {url}")
+        self.video_status_label.configure(text=f"Starting FFplay video: {channel_name_from_url(url)} at {quality}", text_color="#a7b0c8")
+        self.set_stream_health("Healthy", "ffplay")
+        self.log(f"Started ffplay video {quality}: {url}")
+        threading.Thread(
+            target=self._dock_ffplay_player,
+            args=(self.video_play_process, parent_window_id, dock_width, dock_height, window_title),
+            daemon=True,
+        ).start()
         threading.Thread(target=self.monitor_video_popout, args=(url,), daemon=True).start()
         return True
 
     def stop_video_popout(self, user_requested: bool) -> None:
+        self.docked_video_window_id = None
+        self.ffplay_video_fullscreen = False
+        self.ffplay_dock_parent_id = None
         processes = [self.video_play_process, self.video_stream_process]
         for process in processes:
             if process and process.poll() is None:
@@ -2817,7 +3692,8 @@ class TwitchAudioApp(ctk.CTk):
         self.video_stream_process = None
         self.video_play_process = None
         self.is_video_popped = False
-        self.pop_video_button.configure(text="Start Player Window")
+        if self.pop_video_button is not None:
+            self.pop_video_button.configure(text="Start FFplay Dock")
         self.video_status_label.configure(text=VIDEO_READY_MESSAGE, text_color="#a7b0c8")
         self.set_stream_health("Idle" if user_requested else "Stopped")
         self.status_label.configure(text="Ready", text_color="#72f2c7")
@@ -2825,14 +3701,14 @@ class TwitchAudioApp(ctk.CTk):
         self.start_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         if user_requested:
-            self.log("Stopped player window.")
+            self.log("Stopped ffplay video.")
 
     def monitor_video_popout(self, url: str) -> None:
         while self.is_video_popped:
             stream_code = self.video_stream_process.poll() if self.video_stream_process else None
             play_code = self.video_play_process.poll() if self.video_play_process else None
             if stream_code is not None or play_code is not None:
-                self.event_queue.put(("video_popout_stopped", f"Player window ended: {channel_name_from_url(url)}"))
+                self.event_queue.put(("video_popout_stopped", f"FFplay ended: {channel_name_from_url(url)}"))
                 return
             time.sleep(PROCESS_MONITOR_INTERVAL_SECONDS)
 
@@ -2885,7 +3761,7 @@ class TwitchAudioApp(ctk.CTk):
             now = time.time()
             if now - last_heartbeat >= PROCESS_HEARTBEAT_SECONDS:
                 last_heartbeat = now
-                player_name = "mpv" if self.embedded_video_process is not None else "ffplay"
+                player_name = "ffplay"
                 if self.diagnostics_visible:
                     self.event_queue.put((
                         "diagnostic",
@@ -2916,10 +3792,10 @@ class TwitchAudioApp(ctk.CTk):
                     if play_error:
                         details.append(f"ffplay: {play_error}")
                 if embedded_code is not None:
-                    details.append(f"mpv exit={embedded_code}")
-                    mpv_error = self._process_error_tail(self.embedded_video_process, "mpv")
-                    if mpv_error:
-                        details.append(f"mpv: {mpv_error}")
+                    details.append(f"ffplay-video exit={embedded_code}")
+                    ffplay_video_error = self._process_error_tail(self.embedded_video_process, "ffplay-video")
+                    if ffplay_video_error:
+                        details.append(f"ffplay-video: {ffplay_video_error}")
                 event = "video_retry" if self.embedded_video_process is not None or embedded_code is not None else "stopped"
                 self.event_queue.put((event, "\n".join(details)))
                 return
@@ -2961,8 +3837,8 @@ class TwitchAudioApp(ctk.CTk):
             text=f"Playing in app: {channel_name_from_url(self.video_last_url)} at {self.video_last_quality}",
             text_color="#a7b0c8",
         )
-        self.set_stream_health("Recovering", "buffer refilled")
-        self.after(5000, lambda: self.set_stream_health("Healthy", f"{self.video_last_quality} buffer {VIDEO_CACHE_SECONDS}s") if self.is_streaming and not self.stopping_stream else None)
+        self.set_stream_health("Recovering", "ffplay reconnect")
+        self.after(5000, lambda: self.set_stream_health("Healthy", "ffplay") if self.is_streaming and not self.stopping_stream else None)
         threading.Thread(target=self.monitor_stream, args=(self.video_last_url,), daemon=True).start()
 
     def process_events(self) -> None:
@@ -2974,7 +3850,7 @@ class TwitchAudioApp(ctk.CTk):
                 if event == "stopped" and self.is_streaming:
                     self.stop_stream(user_requested=False)
                     self.log(detail)
-                    if "mpv exit" in detail or "streamlink exit" in detail:
+                    if "ffplay-video exit" in detail or "streamlink exit" in detail:
                         self.video_status_label.configure(text=detail[:260], text_color="#ffb86c")
                 elif event == "video_retry":
                     self.retry_embedded_video(detail)
