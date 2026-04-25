@@ -16,6 +16,7 @@ import socket
 import ssl
 import webbrowser
 import html
+import hashlib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,6 +27,7 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 try:
+    import tkinter as tk
     from tkinter import BooleanVar, PhotoImage, messagebox
 
     import customtkinter as ctk
@@ -43,11 +45,6 @@ except ModuleNotFoundError as exc:
     sys.exit(1)
 
 try:
-    from PIL import Image
-except ModuleNotFoundError:
-    Image = None
-
-try:
     import bleach
 except ModuleNotFoundError:
     bleach = None
@@ -55,7 +52,28 @@ except ModuleNotFoundError:
 
 APP_NAME = "TwitchAudio"
 DEFAULT_STREAM_URL = "https://www.twitch.tv/beardhero"
-LOGO_PATH = Path(__file__).resolve().parent / "logo.png"
+EXPECTED_LOGO_SHA256 = "d1f56736caa9f9cd80361aba9fb0bc8773df42653f4668a9d6a16752eb02bd86"
+LOGO_FILENAMES = (f"{EXPECTED_LOGO_SHA256}.png", "logo.png")
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def find_verified_logo_path() -> Path | None:
+    base_dir = Path(__file__).resolve().parent
+    candidates = [base_dir / filename for filename in LOGO_FILENAMES]
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and sha256_file(candidate) == EXPECTED_LOGO_SHA256:
+                return candidate
+        except OSError:
+            continue
+    return None
 LEGACY_APP_DIR = Path.home() / ".twitchaudio"
 
 
@@ -95,6 +113,8 @@ TWITCH_DEVICE_ENDPOINT = "https://id.twitch.tv/oauth2/device"
 TWITCH_TOKEN_ENDPOINT = "https://id.twitch.tv/oauth2/token"
 TWITCH_VALIDATE_ENDPOINT = "https://id.twitch.tv/oauth2/validate"
 TWITCH_HELIX_ENDPOINT = "https://api.twitch.tv/helix"
+TWITCH_GQL_ENDPOINT = "https://gql.twitch.tv/gql"
+TWITCH_WEB_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 TWITCH_CHAT_SCOPES = "chat:read chat:edit"
 PLAYBACK_AUDIO_ONLY = "Audio only"
 PLAYBACK_LOW_VIDEO = "Video"
@@ -1482,6 +1502,68 @@ class TwitchOAuthManager:
             add_slug(alias if "-" in alias else self._category_slug_from_name(alias))
         return slugs
 
+    def _fetch_twitch_directory_page(self, slug: str, max_bytes: int = 2 * 1024 * 1024) -> str:
+        clean_slug = sanitize_text(slug, max_chars=100).lower()
+        clean_slug = re.sub(r"[^a-z0-9-]+", "-", clean_slug).strip("-")
+        if not clean_slug:
+            return ""
+        url = f"https://www.twitch.tv/directory/category/{urllib.parse.quote(clean_slug)}"
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 TwitchAudio/1.0",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.twitch.tv/",
+            },
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                raw = response.read(max_bytes)
+        except Exception:
+            return ""
+        return html.unescape(raw.decode("utf-8", errors="replace"))
+
+    def _category_id_from_directory_page(self, slug: str, category_aliases: list[str]) -> str:
+        page = self._fetch_twitch_directory_page(slug, max_bytes=3 * 1024 * 1024)
+        if not page:
+            return ""
+
+        clean_slug = sanitize_text(slug, max_chars=100).lower()
+        clean_slug = re.sub(r"[^a-z0-9-]+", "-", clean_slug).strip("-")
+        normalized_aliases = {
+            sanitize_text(alias, max_chars=100).lower().replace("&", "and").replace("-", " ")
+            for alias in category_aliases
+            if sanitize_text(alias, max_chars=100)
+        }
+        normalized_aliases.add(clean_slug.replace("-", " "))
+
+        def snippet_matches_category(snippet: str) -> bool:
+            normalized_snippet = snippet.lower().replace("&", "and").replace("-", " ")
+            return (clean_slug and clean_slug in snippet.lower()) or any(
+                alias and alias in normalized_snippet for alias in normalized_aliases
+            )
+
+        patterns = (
+            r'"id"\s*:\s*"(\d+)".{0,1600}"slug"\s*:\s*"' + re.escape(clean_slug) + r'"',
+            r'"slug"\s*:\s*"' + re.escape(clean_slug) + r'".{0,1600}"id"\s*:\s*"(\d+)"',
+            r'"game"\s*:\s*\{.{0,1200}"id"\s*:\s*"(\d+)"',
+            r'"targetID"\s*:\s*"(\d+)".{0,600}"targetType"\s*:\s*"GAME"',
+            r'"gameID"\s*:\s*"(\d+)"',
+            r'"gameId"\s*:\s*"(\d+)"',
+            r'"categoryID"\s*:\s*"(\d+)"',
+            r'"categoryId"\s*:\s*"(\d+)"',
+        )
+        for source in (page, page.replace(r"\u0026", "&").replace(r"\/", "/")):
+            for pattern in patterns:
+                for match in re.finditer(pattern, source, flags=re.DOTALL):
+                    start = max(0, match.start() - 900)
+                    end = min(len(source), match.end() + 900)
+                    if snippet_matches_category(source[start:end]):
+                        return match.group(1)
+        return ""
+
     def _category_id_candidates(self, category: str) -> list[str]:
         category = sanitize_text(category, max_chars=80)
         aliases = self._category_query_aliases(category)
@@ -1491,6 +1573,9 @@ class TwitchOAuthManager:
             candidate = str(value or "").strip()
             if candidate and candidate not in candidates:
                 candidates.append(candidate)
+
+        for slug in self._category_slug_candidates(category):
+            add_candidate(self._category_id_from_directory_page(slug, aliases))
 
         for alias in aliases:
             add_candidate(TWITCH_CATEGORY_IDS.get(alias, ""))
@@ -1603,26 +1688,93 @@ class TwitchOAuthManager:
                     streams.append(record)
         return self._dedupe_streams(streams, limit)
 
+    def _streams_from_twitch_graphql_category(self, category: str, slug: str, limit: int) -> list[dict[str, str]]:
+        clean_category = sanitize_text(category, max_chars=80)
+        clean_slug = sanitize_text(slug, max_chars=100).lower()
+        clean_slug = re.sub(r"[^a-z0-9-]+", "-", clean_slug).strip("-")
+        gql_queries: list[dict[str, Any]] = []
+
+        # Twitch's web directory is slug-driven, while Helix is category-id driven.
+        # Some categories can come back empty through Helix in app tokens, so this
+        # fallback asks the same public GraphQL endpoint used by Twitch's directory.
+        if clean_slug:
+            gql_queries.append({
+                "operationName": "TwitchAudioDirectoryBySlug",
+                "variables": {"slug": clean_slug, "limit": max(1, min(limit, 100))},
+                "query": """
+                query TwitchAudioDirectoryBySlug($slug: String!, $limit: Int!) {
+                  game(slug: $slug) {
+                    streams(first: $limit, options: {sort: VIEWER_COUNT}) {
+                      edges { node { title broadcaster { login displayName } } }
+                    }
+                  }
+                }
+                """,
+            })
+        if clean_category:
+            gql_queries.append({
+                "operationName": "TwitchAudioDirectoryByName",
+                "variables": {"name": clean_category, "limit": max(1, min(limit, 100))},
+                "query": """
+                query TwitchAudioDirectoryByName($name: String!, $limit: Int!) {
+                  game(name: $name) {
+                    streams(first: $limit, options: {sort: VIEWER_COUNT}) {
+                      edges { node { title broadcaster { login displayName } } }
+                    }
+                  }
+                }
+                """,
+            })
+
+        streams: list[dict[str, str]] = []
+        for payload in gql_queries:
+            request = urllib.request.Request(
+                TWITCH_GQL_ENDPOINT,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Client-Id": TWITCH_WEB_CLIENT_ID,
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0 TwitchAudio/1.0",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    raw = response.read(512 * 1024)
+                decoded = json.loads(raw.decode("utf-8"))
+            except Exception:
+                continue
+            if not isinstance(decoded, dict):
+                continue
+            data = decoded.get("data")
+            game = data.get("game") if isinstance(data, dict) else None
+            stream_connection = game.get("streams") if isinstance(game, dict) else None
+            edges = stream_connection.get("edges", []) if isinstance(stream_connection, dict) else []
+            for edge in edges:
+                node = edge.get("node") if isinstance(edge, dict) else None
+                broadcaster = node.get("broadcaster") if isinstance(node, dict) else None
+                if not isinstance(broadcaster, dict):
+                    continue
+                record = self._stream_record_from_parts(
+                    broadcaster.get("login"),
+                    broadcaster.get("displayName"),
+                    node.get("title") if isinstance(node, dict) else "",
+                )
+                if record:
+                    streams.append(record)
+            streams = self._dedupe_streams(streams, limit)
+            if streams:
+                return streams
+        return self._dedupe_streams(streams, limit)
+
     def _streams_from_directory_slug(self, slug: str, limit: int) -> list[dict[str, str]]:
         slug = sanitize_text(slug, max_chars=100).lower()
         slug = re.sub(r"[^a-z0-9-]+", "-", slug).strip("-")
         if not slug:
             return []
-        url = f"https://www.twitch.tv/directory/category/{urllib.parse.quote(slug)}"
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 TwitchAudio/1.0",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            },
-            method="GET",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                raw = response.read(2 * 1024 * 1024)
-        except Exception:
+        page = self._fetch_twitch_directory_page(slug)
+        if not page:
             return []
-        page = html.unescape(raw.decode("utf-8", errors="replace"))
         candidates: list[str] = []
 
         def add_login(value: str) -> None:
@@ -1663,6 +1815,11 @@ class TwitchOAuthManager:
         streams = self._dedupe_streams(all_streams, limit)
         if streams:
             return streams
+
+        for slug in self._category_slug_candidates(clean_category):
+            streams = self._streams_from_twitch_graphql_category(clean_category, slug, limit)
+            if streams:
+                return streams
 
         for slug in self._category_slug_candidates(clean_category):
             streams = self._streams_from_directory_slug(slug, limit)
@@ -2550,17 +2707,34 @@ class TwitchAudioApp(ctk.CTk):
         sidebar.grid(row=0, column=0, sticky="nsew")
         sidebar.grid_propagate(False)
 
-        self.logo_image: Any | None = None
-        if LOGO_PATH.exists() and Image is not None:
+        self.logo_image: PhotoImage | None = None
+        self.logo_label: tk.Label | None = None
+        logo_path = find_verified_logo_path()
+        if logo_path is not None:
             try:
-                raw_logo = Image.open(LOGO_PATH)
-                width, height = raw_logo.size
-                scale = min(235 / max(width, 1), 134 / max(height, 1), 1.0)
-                display_size = (max(1, int(width * scale)), max(1, int(height * scale)))
-                self.logo_image = ctk.CTkImage(light_image=raw_logo, dark_image=raw_logo, size=display_size)
-                ctk.CTkLabel(sidebar, image=self.logo_image, text="").pack(anchor="w", padx=24, pady=(20, 4))
+                logo_image = PhotoImage(file=str(logo_path))
+                width = max(1, logo_image.width())
+                height = max(1, logo_image.height())
+                shrink = max(1, int(max((width + 234) // 235, (height + 133) // 134)))
+                if shrink > 1:
+                    logo_image = logo_image.subsample(shrink, shrink)
+                self.logo_image = logo_image
+                self.logo_label = tk.Label(
+                    sidebar,
+                    image=self.logo_image,
+                    text="",
+                    bg="#0d111f",
+                    bd=0,
+                    highlightthickness=0,
+                    padx=0,
+                    pady=0,
+                )
+                self.logo_label.pack(anchor="w", padx=24, pady=(20, 4))
+                self.log(f"Verified logo loaded: sha256={EXPECTED_LOGO_SHA256}")
             except Exception as exc:
-                self.log(f"Logo could not be loaded: {exc}")
+                self.log(f"Verified logo could not be loaded: {exc}")
+        else:
+            self.log("Logo skipped: no matching sha256-verified logo file found.")
 
         if not self.logo_image:
             ctk.CTkLabel(
