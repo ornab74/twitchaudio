@@ -119,8 +119,33 @@ TWITCH_CHAT_SCOPES = "chat:read chat:edit"
 PLAYBACK_AUDIO_ONLY = "Audio only"
 PLAYBACK_LOW_VIDEO = "Video"
 QUALITY_AUDIO_ONLY = "audio_only"
-LOW_VIDEO_QUALITIES = ("160p", "360p", "480p", "720p", "720p60", "1080p", "1080p60", "best")
+DEFAULT_VIDEO_QUALITY = "360p"
+LOW_VIDEO_QUALITIES = (
+    "160p",
+    "160p30",
+    "360p",
+    "360p30",
+    "480p",
+    "480p30",
+    "720p",
+    "720p30",
+    "720p60",
+    "1080p",
+    "1080p30",
+    "1080p60",
+    "1440p",
+    "1440p30",
+    "1440p60",
+    "2160p",
+    "2160p30",
+    "2160p60",
+    "best",
+)
 PLAYBACK_QUALITIES = (QUALITY_AUDIO_ONLY, *LOW_VIDEO_QUALITIES)
+PLAYBACK_QUALITY_SET = frozenset(PLAYBACK_QUALITIES)
+VIDEO_QUALITY_SET = frozenset(LOW_VIDEO_QUALITIES)
+PLAYBACK_MODE_SET = frozenset((PLAYBACK_AUDIO_ONLY, PLAYBACK_LOW_VIDEO))
+QUALITY_RE = re.compile(r"^(\d{3,4})p(?:(\d{2,3}))?$")
 MAX_CHAT_LINES = 400
 MAX_CHAT_MESSAGE_CHARS = 500
 MAX_CHAT_USER_CHARS = 32
@@ -133,6 +158,7 @@ VIDEO_RETRY_MAX_MS = 12000
 VIDEO_CACHE_SECONDS = 90
 STREAMLINK_RINGBUFFER_SIZE = "256M"
 STREAMLINK_SEGMENT_THREADS = "4"
+STREAMLINK_QUALITY_PROBE_TIMEOUT_SECONDS = 15.0
 CHAT_SOCKET_TIMEOUT_SECONDS = 2.0
 ONLINE_STATUS_REFRESH_SECONDS = 300
 EXPLORE_CACHE_SECONDS = 120
@@ -334,6 +360,73 @@ def twitch_channel_from_url(url: str) -> str | None:
     if re.fullmatch(r"[a-z0-9_]{3,25}", candidate):
         return candidate
     return None
+
+
+def sanitize_playback_quality(value: Any, allow_audio: bool = True) -> str | None:
+    quality = sanitize_text(value, max_chars=32)
+    allowed = PLAYBACK_QUALITY_SET if allow_audio else VIDEO_QUALITY_SET
+    if quality in allowed and (allow_audio or quality != QUALITY_AUDIO_ONLY):
+        return quality
+    return None
+
+
+def sanitize_playback_mode(value: Any) -> str:
+    mode = sanitize_text(value, max_chars=32)
+    return mode if mode in PLAYBACK_MODE_SET else PLAYBACK_AUDIO_ONLY
+
+
+def video_quality_profile(quality: str) -> tuple[int, int] | None:
+    match = QUALITY_RE.fullmatch(quality)
+    if not match:
+        return None
+    height = int(match.group(1))
+    fps = int(match.group(2) or 30)
+    return height, fps
+
+
+def closest_video_quality(requested: str, available: list[str] | tuple[str, ...]) -> str | None:
+    requested_quality = sanitize_playback_quality(requested, allow_audio=False)
+    if requested_quality is None:
+        return None
+
+    safe_available = tuple(
+        dict.fromkeys(
+            quality
+            for candidate in available
+            if (quality := sanitize_playback_quality(candidate, allow_audio=False)) is not None
+        )
+    )
+    if requested_quality in safe_available:
+        return requested_quality
+    if not safe_available:
+        return None
+
+    if requested_quality == "best":
+        parseable = [(quality, video_quality_profile(quality)) for quality in safe_available]
+        ranked = [(quality, profile) for quality, profile in parseable if profile is not None]
+        if ranked:
+            return max(ranked, key=lambda item: (item[1][0], item[1][1]))[0]
+        return "best" if "best" in safe_available else safe_available[0]
+
+    requested_profile = video_quality_profile(requested_quality)
+    ranked = [
+        (quality, profile)
+        for quality in safe_available
+        if (profile := video_quality_profile(quality)) is not None
+    ]
+    if requested_profile is not None and ranked:
+        requested_height, requested_fps = requested_profile
+        return min(
+            ranked,
+            key=lambda item: (
+                abs(item[1][0] - requested_height),
+                abs(item[1][1] - requested_fps),
+                item[1][0] > requested_height,
+                item[1][0],
+            ),
+        )[0]
+
+    return "best" if "best" in safe_available else safe_available[0]
 
 
 def _load_x11() -> ctypes.CDLL | None:
@@ -970,14 +1063,21 @@ class EncryptedHistoryStore:
                 payload = self._decrypt_payload(row["payload"])
             except (ValueError, json.JSONDecodeError):
                 continue
+            quality = sanitize_playback_quality(payload.get("quality")) or QUALITY_AUDIO_ONLY
+            default_mode = PLAYBACK_LOW_VIDEO if quality in LOW_VIDEO_QUALITIES else PLAYBACK_AUDIO_ONLY
+            playback_mode = sanitize_playback_mode(payload.get("playback_mode") or default_mode)
+            if quality == QUALITY_AUDIO_ONLY:
+                playback_mode = PLAYBACK_AUDIO_ONLY
+            elif playback_mode == PLAYBACK_AUDIO_ONLY:
+                playback_mode = PLAYBACK_LOW_VIDEO
 
             records.append(
                 StreamRecord(
                     id=int(row["id"]),
                     title=str(payload.get("title") or channel_name_from_url(str(payload.get("url", "")))),
                     url=str(payload.get("url") or ""),
-                    playback_mode=str(payload.get("playback_mode") or (PLAYBACK_LOW_VIDEO if str(payload.get("quality")) in LOW_VIDEO_QUALITIES else PLAYBACK_AUDIO_ONLY)),
-                    quality=str(payload.get("quality") or "audio_only"),
+                    playback_mode=playback_mode,
+                    quality=quality,
                     volume=float(payload.get("volume") or 2.0),
                     created_at=str(row["created_at"]),
                     updated_at=str(row["updated_at"]),
@@ -997,7 +1097,17 @@ class EncryptedHistoryStore:
         playback_mode: str | None = None,
     ) -> StreamRecord:
         assert self.connection is not None
-        normalized_url = url.strip()
+        normalized_url = sanitize_text(url, max_chars=300).strip()
+        safe_quality = sanitize_playback_quality(quality)
+        if safe_quality is None:
+            raise ValueError("Unsupported playback quality.")
+        quality = safe_quality
+        default_mode = PLAYBACK_LOW_VIDEO if quality in LOW_VIDEO_QUALITIES else PLAYBACK_AUDIO_ONLY
+        safe_playback_mode = sanitize_playback_mode(playback_mode or default_mode)
+        if quality == QUALITY_AUDIO_ONLY:
+            safe_playback_mode = PLAYBACK_AUDIO_ONLY
+        elif safe_playback_mode == PLAYBACK_AUDIO_ONLY:
+            safe_playback_mode = PLAYBACK_LOW_VIDEO
         title = channel_name_from_url(normalized_url)
         now = utc_now()
 
@@ -1006,7 +1116,7 @@ class EncryptedHistoryStore:
                 payload = {
                     "title": record.title or title,
                     "url": normalized_url,
-                    "playback_mode": playback_mode or record.playback_mode,
+                    "playback_mode": safe_playback_mode,
                     "quality": quality,
                     "volume": volume,
                 }
@@ -1030,7 +1140,7 @@ class EncryptedHistoryStore:
         payload = {
             "title": title,
             "url": normalized_url,
-            "playback_mode": playback_mode or (PLAYBACK_LOW_VIDEO if quality in LOW_VIDEO_QUALITIES else PLAYBACK_AUDIO_ONLY),
+            "playback_mode": safe_playback_mode,
             "quality": quality,
             "volume": volume,
         }
@@ -3463,6 +3573,74 @@ class TwitchAudioApp(ctk.CTk):
         statuses = {channel.lower(): channel.lower() in online for channel in channels}
         self.event_queue.put(("online_statuses", json.dumps(statuses)))
 
+    def _streamlink_available_qualities(self, url: str) -> tuple[str, ...]:
+        command = [
+            "streamlink",
+            "--json",
+            "--twitch-disable-ads",
+            url,
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=STREAMLINK_QUALITY_PROBE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Timed out checking available Twitch resolutions.") from exc
+
+        if result.returncode != 0:
+            detail = sanitize_text(result.stderr or result.stdout, max_chars=300)
+            message = "Streamlink could not list available Twitch resolutions."
+            if detail:
+                message = f"{message} {detail}"
+            raise RuntimeError(message)
+
+        try:
+            payload = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            detail = sanitize_text(result.stdout or result.stderr, max_chars=300)
+            message = "Streamlink returned an unreadable resolution list."
+            if detail:
+                message = f"{message} {detail}"
+            raise RuntimeError(message) from exc
+
+        streams = payload.get("streams") if isinstance(payload, dict) else None
+        if not isinstance(streams, dict):
+            return ()
+
+        qualities: list[str] = []
+        for name in streams:
+            quality = sanitize_playback_quality(name)
+            if quality and quality not in qualities:
+                qualities.append(quality)
+        return tuple(qualities)
+
+    def _resolve_video_quality(self, url: str, requested: str) -> str:
+        requested_quality = sanitize_playback_quality(requested, allow_audio=False)
+        if requested_quality is None:
+            raise ValueError("Choose a listed Twitch resolution.")
+
+        available = self._streamlink_available_qualities(url)
+        resolved = closest_video_quality(requested_quality, available)
+        if resolved is None:
+            raise RuntimeError("This stream did not expose any supported video resolutions.")
+
+        if resolved != requested_quality:
+            available_video = [quality for quality in available if quality in LOW_VIDEO_QUALITIES]
+            offered = ", ".join(available_video[:8])
+            if len(available_video) > 8:
+                offered = f"{offered}, ..."
+            self.quality_option.set(resolved)
+            self.log(
+                f"{requested_quality} is unavailable for this stream; using closest supported quality {resolved}"
+                + (f" from: {offered}." if offered else ".")
+            )
+        return resolved
+
     def _streamlink_command(self, url: str, quality: str) -> list[str]:
         return [
             "streamlink",
@@ -3790,12 +3968,12 @@ class TwitchAudioApp(ctk.CTk):
 
     def _selected_stream(self) -> tuple[str, str, float] | None:
         url = sanitize_text(self.url_entry.get(), max_chars=300)
-        quality = self.quality_option.get()
+        quality = sanitize_playback_quality(self.quality_option.get())
         volume = float(self.volume_slider.get())
         if not looks_like_url(url):
             messagebox.showerror("Invalid URL", "Please enter a full HTTPS Twitch URL, like https://www.twitch.tv/beardhero.")
             return None
-        if quality != QUALITY_AUDIO_ONLY and quality not in LOW_VIDEO_QUALITIES:
+        if quality is None:
             messagebox.showerror("Unsafe quality", "Choose a listed Twitch quality.")
             return None
         return url, quality, volume
@@ -3828,6 +4006,14 @@ class TwitchAudioApp(ctk.CTk):
             )
             self.log("Missing dependency: " + ", ".join(missing))
             return False
+
+        if video_mode:
+            try:
+                quality = self._resolve_video_quality(url, quality)
+            except Exception as exc:
+                messagebox.showerror("Could not choose video quality", str(exc))
+                self.log(f"Quality fallback failed: {exc}")
+                return False
 
         try:
             if video_mode:
@@ -3934,7 +4120,7 @@ class TwitchAudioApp(ctk.CTk):
             return False
         url, quality, volume = selected
         if quality == QUALITY_AUDIO_ONLY:
-            quality = "360p"
+            quality = DEFAULT_VIDEO_QUALITY
             self.quality_option.set(quality)
             self.playback_mode_option.set(PLAYBACK_LOW_VIDEO)
             self.on_playback_mode_changed(PLAYBACK_LOW_VIDEO)
@@ -3943,6 +4129,13 @@ class TwitchAudioApp(ctk.CTk):
         if missing:
             messagebox.showerror("Missing tools", "Install these command line tools first: " + ", ".join(missing))
             self.log("Missing dependency: " + ", ".join(missing))
+            return False
+
+        try:
+            quality = self._resolve_video_quality(url, quality)
+        except Exception as exc:
+            messagebox.showerror("Could not choose video quality", str(exc))
+            self.log(f"Quality fallback failed: {exc}")
             return False
 
         if self.is_streaming:
