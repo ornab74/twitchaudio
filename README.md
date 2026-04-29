@@ -1,3 +1,4 @@
+
 # Twitch Freedom
 
 Twitch Freedom is a compact CustomTkinter desktop app for launching Twitch streams with Streamlink and `ffplay`, saving stream history in a local encrypted SQLite vault, browsing live Twitch streams from inside the app, and joining Twitch chat through a Twitch Developer application configured in Settings.
@@ -5,6 +6,7 @@ Twitch Freedom is a compact CustomTkinter desktop app for launching Twitch strea
 The current implementation lives in `main.py`.
 
 > Note: the code may still contain legacy internal names such as `TwitchAudio` for app directories, window titles, or migration compatibility. This README uses the new product name: **Twitch Freedom**.
+<img width="1628" height="1144" alt="demotwitchfreedom" src="https://github.com/user-attachments/assets/a16824bf-c6bb-4c8b-a700-c10a0f51f8c3" />
 
 ## What Changed
 
