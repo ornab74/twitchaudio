@@ -115,7 +115,8 @@ TWITCH_VALIDATE_ENDPOINT = "https://id.twitch.tv/oauth2/validate"
 TWITCH_HELIX_ENDPOINT = "https://api.twitch.tv/helix"
 TWITCH_GQL_ENDPOINT = "https://gql.twitch.tv/gql"
 TWITCH_WEB_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
-TWITCH_CHAT_SCOPES = "chat:read chat:edit"
+TWITCH_CHAT_SCOPES = "chat:read user:write:chat"
+TWITCH_SEND_CHAT_SCOPE = "user:write:chat"
 PLAYBACK_AUDIO_ONLY = "Audio only"
 PLAYBACK_LOW_VIDEO = "Video"
 QUALITY_AUDIO_ONLY = "audio_only"
@@ -160,6 +161,7 @@ STREAMLINK_RINGBUFFER_SIZE = "256M"
 STREAMLINK_SEGMENT_THREADS = "4"
 STREAMLINK_QUALITY_PROBE_TIMEOUT_SECONDS = 15.0
 CHAT_SOCKET_TIMEOUT_SECONDS = 2.0
+CHAT_SEND_CONFIRM_SECONDS = 20.0
 ONLINE_STATUS_REFRESH_SECONDS = 300
 EXPLORE_CACHE_SECONDS = 120
 EXPLORE_PAGE_SIZE = 25
@@ -1358,6 +1360,39 @@ class TwitchOAuthManager:
     def __init__(self, history: EncryptedHistoryStore) -> None:
         self.history = history
 
+    def _scope_set(self, value: Any) -> set[str]:
+        if isinstance(value, str):
+            raw_scopes = value.split()
+        elif isinstance(value, list):
+            raw_scopes = [str(item) for item in value]
+        else:
+            raw_scopes = []
+        scopes: set[str] = set()
+        for scope in raw_scopes:
+            clean_scope = sanitize_text(scope, max_chars=80)
+            if clean_scope:
+                scopes.add(clean_scope)
+        return scopes
+
+    def _state_scopes(self) -> set[str]:
+        state = self.get_state()
+        return self._scope_set(state.get("scope") or state.get("scopes"))
+
+    def _http_error_detail(self, exc: urllib.error.HTTPError) -> str:
+        detail = exc.read(128 * 1024).decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(detail)
+        except json.JSONDecodeError:
+            return sanitize_text(detail or str(exc), max_chars=400)
+        if isinstance(payload, dict):
+            message = sanitize_text(payload.get("message"), max_chars=300)
+            error = sanitize_text(payload.get("error"), max_chars=120)
+            if message and error:
+                return f"{error}: {message}"
+            if message:
+                return message
+        return sanitize_text(detail or str(exc), max_chars=400)
+
     def get_state(self) -> dict[str, Any]:
         return self.history.get_secret_setting(TWITCH_OAUTH_KEY) or {}
 
@@ -1449,6 +1484,103 @@ class TwitchOAuthManager:
             raise RuntimeError("Twitch token is valid, but Twitch did not return a login name.")
         return login, format_chat_token(token)
 
+    def ensure_token_scope(self, required_scope: str) -> None:
+        if required_scope in self._state_scopes():
+            return
+        token = self.get_valid_access_token()
+        validation = self.validate_access_token(token)
+        scopes = self._scope_set(validation.get("scopes") or validation.get("scope")) or self._state_scopes()
+        if required_scope not in scopes:
+            raise RuntimeError(
+                f"Twitch token is missing {required_scope}. Open Settings and Generate Token again."
+            )
+
+    def get_current_user_id(self) -> str:
+        state = self.get_state()
+        user_id = sanitize_text(state.get("user_id"), max_chars=64)
+        if user_id:
+            return user_id
+
+        token = self.get_valid_access_token()
+        validation = self.validate_access_token(token)
+        user_id = sanitize_text(validation.get("user_id"), max_chars=64)
+        if not user_id:
+            raise RuntimeError("Twitch token is valid, but Twitch did not return a user id.")
+        return user_id
+
+    def get_user_id_for_login(self, login: str) -> str:
+        login = sanitize_chat_user(login).lower()
+        if login == "unknown":
+            raise RuntimeError("Enter a valid Twitch channel before sending chat.")
+        payload = self.helix_get("/users", [("login", login)])
+        for item in payload.get("data", []):
+            if not isinstance(item, dict):
+                continue
+            if sanitize_chat_user(item.get("login")).lower() != login:
+                continue
+            user_id = sanitize_text(item.get("id"), max_chars=64)
+            if user_id:
+                return user_id
+        raise RuntimeError(f"Twitch could not find channel #{login}.")
+
+    def send_chat_message(self, channel: str, message: str) -> str:
+        channel = sanitize_chat_user(channel)
+        message = sanitize_chat_message(message)
+        if channel == "unknown":
+            raise RuntimeError("Enter a valid Twitch channel before sending chat.")
+        if not message:
+            raise RuntimeError("Enter a message before sending chat.")
+
+        self.ensure_token_scope(TWITCH_SEND_CHAT_SCOPE)
+        token = self.get_valid_access_token()
+        state = self.get_state()
+        client_id = sanitize_text(state.get("client_id"), max_chars=128)
+        if not client_id:
+            raise RuntimeError("Twitch Client ID is not configured.")
+
+        body = json.dumps(
+            {
+                "broadcaster_id": self.get_user_id_for_login(channel),
+                "sender_id": self.get_current_user_id(),
+                "message": message,
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"{TWITCH_HELIX_ENDPOINT}/chat/messages",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Client-Id": client_id,
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=15) as response:
+                raw = response.read(64 * 1024)
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(self._http_error_detail(exc)) from exc
+
+        payload = json.loads(raw.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise RuntimeError("Twitch returned an invalid send response.")
+        data = payload.get("data")
+        if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+            raise RuntimeError("Twitch returned an empty send response.")
+        result = data[0]
+        if result.get("is_sent"):
+            return sanitize_text(result.get("message_id"), max_chars=128)
+
+        drop_reason = result.get("drop_reason")
+        if isinstance(drop_reason, dict):
+            code = sanitize_text(drop_reason.get("code"), max_chars=80)
+            reason = sanitize_text(drop_reason.get("message"), max_chars=300)
+            if code and reason:
+                raise RuntimeError(f"Twitch dropped the message ({code}): {reason}")
+            if reason:
+                raise RuntimeError(f"Twitch dropped the message: {reason}")
+        raise RuntimeError("Twitch did not send the message.")
+
     def get_valid_access_token(self) -> str:
         state = self.get_state()
         token = sanitize_text(state.get("access_token"), max_chars=4096)
@@ -1490,6 +1622,12 @@ class TwitchOAuthManager:
         state = self.get_state()
         if payload.get("login"):
             state["login"] = sanitize_chat_user(payload.get("login"))
+        if payload.get("user_id"):
+            state["user_id"] = sanitize_text(payload.get("user_id"), max_chars=64)
+        scopes = payload.get("scopes") or payload.get("scope")
+        if isinstance(scopes, (list, str)):
+            state["scope"] = sorted(self._scope_set(scopes))
+        if payload.get("login") or payload.get("user_id") or isinstance(scopes, (list, str)):
             self.history.set_secret_setting(TWITCH_OAUTH_KEY, state)
         return payload
 
@@ -2011,6 +2149,11 @@ class TwitchOAuthManager:
         validation = self.validate_access_token(access_token)
         if validation.get("login"):
             state["login"] = sanitize_chat_user(validation.get("login"))
+        if validation.get("user_id"):
+            state["user_id"] = sanitize_text(validation.get("user_id"), max_chars=64)
+        validation_scopes = validation.get("scopes") or validation.get("scope")
+        if isinstance(validation_scopes, (list, str)):
+            state["scope"] = sorted(self._scope_set(validation_scopes))
         self.history.set_secret_setting(TWITCH_OAUTH_KEY, state)
         return state
 
@@ -2912,6 +3055,8 @@ class TwitchAudioApp(ctk.CTk):
         self.chat_reader: TwitchChatReader | None = None
         self.chat_channel: str | None = None
         self.pending_chat_messages: list[tuple[str, str, str, str]] = []
+        self.pending_chat_sends: dict[str, tuple[float, str]] = {}
+        self.chat_send_counter = 0
         self.chat_flush_after_id: str | None = None
         self.volume_restart_after_id: str | None = None
         self.suppress_volume_restart = False
@@ -3416,6 +3561,32 @@ class TwitchAudioApp(ctk.CTk):
         if self.chat_flush_after_id is None:
             self.chat_flush_after_id = self.after(CHAT_SAVE_BATCH_MS, self.flush_chat_saves)
 
+    def next_chat_send_id(self) -> str:
+        self.chat_send_counter += 1
+        return f"{int(time.time() * 1000)}-{self.chat_send_counter}"
+
+    def remember_pending_chat_send(self, send_id: str, message: str) -> None:
+        self.pending_chat_sends[send_id] = (time.monotonic() + CHAT_SEND_CONFIRM_SECONDS, message)
+
+    def finish_pending_chat_send(self, send_id: str) -> bool:
+        if not send_id:
+            return True
+        return self.pending_chat_sends.pop(send_id, None) is not None
+
+    def poll_pending_chat_sends(self) -> int:
+        now = time.monotonic()
+        expired = [
+            send_id
+            for send_id, (deadline, _message) in self.pending_chat_sends.items()
+            if deadline <= now
+        ]
+        for send_id in expired:
+            _deadline, message = self.pending_chat_sends.pop(send_id, (now, ""))
+            if message and not sanitize_chat_message(self.chat_entry.get()):
+                self.chat_entry.insert(0, message)
+            self.set_chat_status("Error: message not received by Twitch chat.", "#ffb86c")
+        return len(expired)
+
     def flush_chat_saves(self) -> None:
         self.chat_flush_after_id = None
         if not self.pending_chat_messages:
@@ -3487,6 +3658,7 @@ class TwitchAudioApp(ctk.CTk):
         self.chat_thread = None
         self.chat_reader = None
         self.chat_channel = None
+        self.pending_chat_sends.clear()
         self.chat_status_label.configure(text="Disconnected", text_color="#7f8aa6")
         if user_requested:
             self.add_chat_line("Chat disconnected.")
@@ -3495,21 +3667,50 @@ class TwitchAudioApp(ctk.CTk):
         message = sanitize_chat_message(self.chat_entry.get())
         if not message:
             return
-        if not self.chat_reader or not self.chat_thread or not self.chat_thread.is_alive():
+        if not self.chat_thread or not self.chat_thread.is_alive():
             self.set_chat_status("Connect chat before sending.", "#ffb86c")
             return
-        try:
-            if not self.chat_reader.send_chat_message(message):
-                self.set_chat_status("Chat is not ready to send yet.", "#ffb86c")
-                return
-        except OSError as exc:
-            self.set_chat_status(f"Send failed: {exc}", "#ffb86c")
+        channel = self.chat_channel or twitch_channel_from_url(self.url_entry.get())
+        if not channel:
+            self.set_chat_status("Chat channel missing.", "#ffb86c")
             return
 
         self.chat_entry.delete(0, "end")
-        if self.chat_channel:
-            self.queue_chat_save(self.chat_channel, "You", message, "out")
-        self.add_chat_line(f"You: {message}")
+        send_id = self.next_chat_send_id()
+        self.remember_pending_chat_send(send_id, message)
+        self.chat_status_label.configure(text="Sending message...", text_color="#8cbcff")
+        threading.Thread(target=self._send_chat_message, args=(send_id, channel, message), daemon=True).start()
+
+    def _send_chat_message(self, send_id: str, channel: str, message: str) -> None:
+        try:
+            message_id = self.oauth.send_chat_message(channel, message)
+        except Exception as exc:
+            self.event_queue.put(
+                (
+                    "chat_send_failed",
+                    json.dumps(
+                        {
+                            "send_id": send_id,
+                            "message": message,
+                            "error": sanitize_text(str(exc), max_chars=400),
+                        }
+                    ),
+                )
+            )
+            return
+        self.event_queue.put(
+            (
+                "chat_send_success",
+                json.dumps(
+                    {
+                        "send_id": send_id,
+                        "channel": channel,
+                        "message": message,
+                        "message_id": message_id,
+                    }
+                ),
+            )
+        )
 
     def open_chat_popout(self) -> None:
         channel = twitch_channel_from_url(self.url_entry.get())
@@ -4388,6 +4589,37 @@ class TwitchAudioApp(ctk.CTk):
                 elif event == "chat_status":
                     color = "#72f2c7" if detail.startswith("Connected") else "#ffb86c"
                     self.set_chat_status(detail, color)
+                elif event == "chat_send_success":
+                    try:
+                        payload = json.loads(detail)
+                    except json.JSONDecodeError:
+                        continue
+                    send_id = sanitize_text(payload.get("send_id"), max_chars=80)
+                    if not self.finish_pending_chat_send(send_id):
+                        continue
+                    channel = twitch_channel_from_url(str(payload.get("channel") or ""))
+                    if channel is None:
+                        channel = sanitize_chat_user(payload.get("channel"))
+                    message = sanitize_chat_message(payload.get("message"))
+                    if message:
+                        if channel and channel != "unknown":
+                            self.queue_chat_save(channel, "You", message, "out")
+                        self.add_chat_line(f"You: {message}")
+                        self.chat_status_label.configure(text="Message sent", text_color="#72f2c7")
+                elif event == "chat_send_failed":
+                    try:
+                        payload = json.loads(detail)
+                    except json.JSONDecodeError:
+                        self.set_chat_status(f"Send failed: {detail}", "#ffb86c")
+                        continue
+                    send_id = sanitize_text(payload.get("send_id"), max_chars=80)
+                    if not self.finish_pending_chat_send(send_id):
+                        continue
+                    message = sanitize_chat_message(payload.get("message"))
+                    error = sanitize_text(payload.get("error"), max_chars=400) or "Twitch did not accept the message."
+                    if message and not sanitize_chat_message(self.chat_entry.get()):
+                        self.chat_entry.insert(0, message)
+                    self.set_chat_status(f"Error: message not received by Twitch chat. {error}", "#ffb86c")
                 elif event == "online_statuses":
                     self.online_refresh_in_progress = False
                     try:
@@ -4402,7 +4634,8 @@ class TwitchAudioApp(ctk.CTk):
                     self.log(detail)
         except queue.Empty:
             pass
-        next_poll_ms = EVENT_POLL_ACTIVE_MS if processed else EVENT_POLL_IDLE_MS
+        expired_sends = self.poll_pending_chat_sends()
+        next_poll_ms = EVENT_POLL_ACTIVE_MS if processed or expired_sends or self.pending_chat_sends else EVENT_POLL_IDLE_MS
         self.after(next_poll_ms, self.process_events)
 
     def load_record(self, record: StreamRecord) -> None:

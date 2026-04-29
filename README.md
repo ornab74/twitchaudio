@@ -235,7 +235,7 @@ Twitch Freedom supports two chat modes:
 
 | Mode | Setup | Notes |
 | --- | --- | --- |
-| In-app live chat | Create a Twitch Developer application, save Client ID and Client Secret in Settings, then generate a device-code token. | Uses Twitch IRC over TLS and can read/send normal chat messages. |
+| In-app live chat | Create a Twitch Developer application, save Client ID and Client Secret in Settings, then generate a device-code token. | Uses Twitch IRC over TLS for reading and Twitch Helix for sending normal chat messages. |
 | Browser popout | Open the popout chat option in the chat area. | Opens Twitch chat in your default browser and does not require storing OAuth credentials. |
 
 ### Create a Twitch Developer Application
@@ -256,7 +256,7 @@ Twitch Freedom supports two chat modes:
 Twitch Freedom requests these chat scopes:
 
 ```txt
-chat:read chat:edit
+chat:read user:write:chat
 ```
 
 The app stores Twitch credentials and OAuth tokens encrypted in the local vault. It refreshes access tokens automatically when they are near expiry.
@@ -445,6 +445,5 @@ If in-app chat will not connect:
 
 - Confirm the Twitch Developer app Client ID and Client Secret are saved in Settings.
 - Generate a fresh device-code token.
-- Confirm the Twitch account granted `chat:read` and `chat:edit`.
+- Confirm the Twitch account granted `chat:read` and `user:write:chat`.
 - Use browser popout chat as a no-auth fallback.
-
