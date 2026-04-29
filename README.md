@@ -7,6 +7,7 @@ The current implementation lives in `main.py`.
 
 > Note: the code may still contain legacy internal names such as `TwitchAudio` for app directories, window titles, or migration compatibility. This README uses the new product name: **Twitch Freedom**.
 <img width="1628" height="1144" alt="demotwitchfreedom" src="https://github.com/user-attachments/assets/a16824bf-c6bb-4c8b-a700-c10a0f51f8c3" />
+
 ## What Changed
 
 - Renamed the project-facing documentation from **TwitchAudio** to **Twitch Freedom**.
