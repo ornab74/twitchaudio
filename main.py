@@ -355,7 +355,25 @@ def sanitize_text(value: Any, max_chars: int = 500) -> str:
     text = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text).strip()
     text = text[:max_chars]
     text = html.unescape(text)
-    return html.unescape(nh3.clean(text, tags=set(), attributes={})).strip()
+    text = html.unescape(nh3.clean(text, tags=set(), attributes={})).strip()
+    return text[:max_chars]
+
+
+def redact_sensitive_text(value: Any, max_chars: int = 1200) -> str:
+    text = sanitize_text(value, max_chars=max(max_chars * 2, max_chars))
+    redactions = (
+        (r"\boauth:[A-Za-z0-9._~+/=-]+", "oauth:[REDACTED]"),
+        (r"\bBearer\s+[A-Za-z0-9._~+/=-]+", "Bearer [REDACTED]"),
+        (r"(?i)(client_secret\s*[=:]\s*)([^\s,&;\"']+)", r"\1[REDACTED]"),
+        (r"(?i)(access_token\s*[=:]\s*)([^\s,&;\"']+)", r"\1[REDACTED]"),
+        (r"(?i)(refresh_token\s*[=:]\s*)([^\s,&;\"']+)", r"\1[REDACTED]"),
+        (r"(?i)(\"client_secret\"\s*:\s*\")([^\"]+)(\")", r"\1[REDACTED]\3"),
+        (r"(?i)(\"access_token\"\s*:\s*\")([^\"]+)(\")", r"\1[REDACTED]\3"),
+        (r"(?i)(\"refresh_token\"\s*:\s*\")([^\"]+)(\")", r"\1[REDACTED]\3"),
+    )
+    for pattern, replacement in redactions:
+        text = re.sub(pattern, replacement, text)
+    return text[:max_chars]
 
 
 def _is_executable_file(path: Path) -> bool:
@@ -405,11 +423,11 @@ def streamlink_environment_error() -> str | None:
             check=False,
         )
     except Exception as exc:
-        return f"Could not run Streamlink at {executable}: {sanitize_text(exc, max_chars=180)}"
+        return f"Could not run Streamlink at {executable}: {redact_sensitive_text(exc, max_chars=180)}"
 
     output = result.stdout or result.stderr
     if result.returncode != 0:
-        detail = sanitize_text(output, max_chars=180)
+        detail = redact_sensitive_text(output, max_chars=180)
         return f"Could not run Streamlink at {executable}." + (f" {detail}" if detail else "")
 
     version = _parse_streamlink_version(output)
@@ -450,9 +468,13 @@ def derive_key(password: str, salt: bytes) -> bytes:
     return kdf.derive(password.encode("utf-8"))
 
 
+def is_allowed_twitch_host(parsed: urllib.parse.ParseResult) -> bool:
+    return (parsed.hostname or "").lower() in {"twitch.tv", "www.twitch.tv"}
+
+
 def channel_name_from_url(url: str) -> str:
     parsed = urlparse(sanitize_text(url, max_chars=300))
-    if parsed.netloc and "twitch.tv" in parsed.netloc.lower():
+    if is_allowed_twitch_host(parsed):
         channel = parsed.path.strip("/").split("/")[0]
         if channel:
             return channel
@@ -930,7 +952,7 @@ def watch_x11_double_click(window_id: int, on_double_click: Callable[[], None]) 
 
 def looks_like_url(url: str) -> bool:
     parsed = urlparse(sanitize_text(url, max_chars=300))
-    return parsed.scheme == "https" and parsed.netloc.lower() in {"www.twitch.tv", "twitch.tv"}
+    return parsed.scheme == "https" and is_allowed_twitch_host(parsed)
 
 
 def irc_unescape(value: str) -> str:
@@ -1492,15 +1514,15 @@ class TwitchOAuthManager:
         try:
             payload = json.loads(detail)
         except json.JSONDecodeError:
-            return sanitize_text(detail or str(exc), max_chars=400)
+            return redact_sensitive_text(detail or str(exc), max_chars=400)
         if isinstance(payload, dict):
-            message = sanitize_text(payload.get("message"), max_chars=300)
-            error = sanitize_text(payload.get("error"), max_chars=120)
+            message = redact_sensitive_text(payload.get("message"), max_chars=300)
+            error = redact_sensitive_text(payload.get("error"), max_chars=120)
             if message and error:
                 return f"{error}: {message}"
             if message:
                 return message
-        return sanitize_text(detail or str(exc), max_chars=400)
+        return redact_sensitive_text(detail or str(exc), max_chars=400)
 
     def get_state(self) -> dict[str, Any]:
         return self.history.get_secret_setting(TWITCH_OAUTH_KEY) or {}
@@ -1762,7 +1784,7 @@ class TwitchOAuthManager:
             with urllib.request.urlopen(request, timeout=20) as response:
                 raw = response.read(256 * 1024)
         except urllib.error.HTTPError as exc:
-            detail = exc.read(128 * 1024).decode("utf-8", errors="replace")
+            detail = redact_sensitive_text(exc.read(128 * 1024).decode("utf-8", errors="replace"), max_chars=800)
             raise RuntimeError(detail or str(exc)) from exc
         payload = json.loads(raw.decode("utf-8"))
         if not isinstance(payload, dict):
@@ -2327,7 +2349,7 @@ class TwitchOAuthManager:
             with urllib.request.urlopen(request, timeout=20) as response:
                 raw = response.read(128 * 1024)
         except urllib.error.HTTPError as exc:
-            detail = exc.read(128 * 1024).decode("utf-8", errors="replace")
+            detail = redact_sensitive_text(exc.read(128 * 1024).decode("utf-8", errors="replace"), max_chars=800)
             raise RuntimeError(detail or str(exc)) from exc
         payload = json.loads(raw.decode("utf-8"))
         if not isinstance(payload, dict):
@@ -3766,6 +3788,7 @@ class TwitchFreedomApp(ctk.CTk):
 
     def log(self, message: str) -> None:
         timestamp = datetime.now().strftime("%H:%M:%S")
+        message = redact_sensitive_text(message, max_chars=1400)
         line = f"[{timestamp}] {message}\n"
         self.log_lines.append(line)
         self.log_lines = self.log_lines[-500:]
@@ -4064,7 +4087,7 @@ class TwitchFreedomApp(ctk.CTk):
             raise RuntimeError("Timed out checking available Twitch resolutions.") from exc
 
         if result.returncode != 0:
-            detail = sanitize_text(result.stderr or result.stdout, max_chars=300)
+            detail = redact_sensitive_text(result.stderr or result.stdout, max_chars=300)
             message = "Streamlink could not list available Twitch resolutions."
             if detail:
                 message = f"{message} {detail}"
@@ -4073,7 +4096,7 @@ class TwitchFreedomApp(ctk.CTk):
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
-            detail = sanitize_text(result.stdout or result.stderr, max_chars=300)
+            detail = redact_sensitive_text(result.stdout or result.stderr, max_chars=300)
             message = "Streamlink returned an unreadable resolution list."
             if detail:
                 message = f"{message} {detail}"
@@ -4198,7 +4221,7 @@ class TwitchFreedomApp(ctk.CTk):
                     return
                 if not raw:
                     return
-                line = sanitize_text(raw.decode("utf-8", errors="replace"), max_chars=1200)
+                line = redact_sensitive_text(raw.decode("utf-8", errors="replace"), max_chars=1200)
                 if not line:
                     continue
                 tail = self.process_log_tails.setdefault(name, [])
@@ -4213,14 +4236,14 @@ class TwitchFreedomApp(ctk.CTk):
 
     def _process_error_tail(self, process: subprocess.Popen[bytes] | None, name: str | None = None) -> str:
         if name and self.process_log_tails.get(name):
-            return "\n".join(self.process_log_tails[name])[-1200:]
+            return redact_sensitive_text("\n".join(self.process_log_tails[name]), max_chars=1200)
         if process is None or process.stderr is None:
             return ""
         try:
             raw = process.stderr.read(4096)
         except Exception:
             return ""
-        return raw.decode("utf-8", errors="replace").strip()[-1200:]
+        return redact_sensitive_text(raw.decode("utf-8", errors="replace"), max_chars=1200)
 
     def resize_docked_video(self, _event: object | None = None) -> None:
         if not supports_x11_video_docking():
