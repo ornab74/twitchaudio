@@ -141,7 +141,7 @@ sudo apt install -y alsa-utils
 
 ```txt
 customtkinter==5.2.2
-cryptography==42.0.0
+cryptography==47.0.0
 streamlink==8.3.0
 nh3==0.3.5
 ```
