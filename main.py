@@ -3307,7 +3307,9 @@ class TwitchFreedomApp(ctk.CTk):
         self.chat_send_counter = 0
         self.chat_flush_after_id: str | None = None
         self.volume_restart_after_id: str | None = None
+        self.playback_restart_after_id: str | None = None
         self.suppress_volume_restart = False
+        self.suppress_playback_restart = False
         self.is_streaming = False
         self.is_video_popped = False
         self.log_window: ctk.CTkToplevel | None = None
@@ -3457,68 +3459,69 @@ class TwitchFreedomApp(ctk.CTk):
         main = self.main
         main.grid(row=0, column=1, sticky="nsew", padx=26, pady=26)
         main.grid_columnconfigure(0, weight=1)
-        main.grid_rowconfigure(2, weight=1)
+        main.grid_rowconfigure(0, weight=1)
+        main.grid_rowconfigure(1, weight=0)
 
-        self.hero = ctk.CTkFrame(main, fg_color="#121625", corner_radius=24, border_width=1, border_color="#24304a")
+        self.hero = ctk.CTkFrame(main, fg_color="#121625", corner_radius=16, border_width=1, border_color="#24304a")
         hero = self.hero
-        hero.grid(row=0, column=0, sticky="ew")
+        hero.grid(row=1, column=0, sticky="ew", pady=(14, 0))
         hero.grid_columnconfigure(0, weight=1)
         hero.grid_columnconfigure(1, weight=0)
 
         ctk.CTkLabel(
             hero,
             text="Live Stream Control",
-            font=ctk.CTkFont(size=18, weight="bold"),
+            font=ctk.CTkFont(size=15, weight="bold"),
             text_color="#f6f8ff",
-        ).grid(row=0, column=0, sticky="w", padx=18, pady=(12, 0))
+        ).grid(row=0, column=0, sticky="w", padx=16, pady=(10, 0))
         ctk.CTkLabel(
             hero,
             text="Twitch stream controls",
-            font=ctk.CTkFont(size=11),
+            font=ctk.CTkFont(size=10),
             text_color="#8b96b3",
-        ).grid(row=1, column=0, sticky="w", padx=18, pady=(2, 10))
+        ).grid(row=1, column=0, sticky="w", padx=16, pady=(0, 6))
 
-        self.status_card = ctk.CTkFrame(hero, width=245, height=76, fg_color="#151a2a", corner_radius=14, border_width=1, border_color="#26334f")
-        self.status_card.grid(row=0, column=1, rowspan=2, sticky="ne", padx=18, pady=(12, 4))
+        self.status_card = ctk.CTkFrame(hero, width=225, height=58, fg_color="#151a2a", corner_radius=12, border_width=1, border_color="#26334f")
+        self.status_card.grid(row=0, column=1, rowspan=2, sticky="ne", padx=16, pady=(10, 4))
         self.status_card.grid_propagate(False)
         self.status_label = ctk.CTkLabel(
             self.status_card,
             text="Ready",
-            font=ctk.CTkFont(size=18, weight="bold"),
+            font=ctk.CTkFont(size=15, weight="bold"),
             text_color="#72f2c7",
             anchor="w",
         )
-        self.status_label.pack(fill="x", padx=16, pady=(12, 2))
+        self.status_label.pack(fill="x", padx=14, pady=(8, 0))
         self.now_playing_label = ctk.CTkLabel(
             self.status_card,
             text="No active stream",
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=10),
             text_color="#a7b0c8",
-            wraplength=210,
+            wraplength=195,
             justify="left",
             anchor="w",
         )
-        self.now_playing_label.pack(fill="x", padx=16, pady=(0, 12))
+        self.now_playing_label.pack(fill="x", padx=14, pady=(0, 8))
 
         controls = ctk.CTkFrame(hero, fg_color="transparent")
-        controls.grid(row=2, column=0, sticky="ew", padx=18, pady=(0, 14))
+        controls.grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 10))
         controls.grid_columnconfigure(3, weight=1)
 
-        self.url_entry = ctk.CTkEntry(controls, height=48, placeholder_text="https://www.twitch.tv/channel")
-        self.url_entry.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 14))
+        self.url_entry = ctk.CTkEntry(controls, height=38, placeholder_text="https://www.twitch.tv/channel")
+        self.url_entry.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 10))
         self.url_entry.insert(0, DEFAULT_STREAM_URL)
         self.url_entry.grid_remove()
 
         self.playback_mode_option = ctk.CTkOptionMenu(
             controls,
             values=[PLAYBACK_AUDIO_ONLY, PLAYBACK_LOW_VIDEO],
-            height=40,
+            height=34,
             command=self.on_playback_mode_changed,
         )
         self.playback_mode_option.set(PLAYBACK_AUDIO_ONLY)
         self.playback_mode_option.grid(row=1, column=0, sticky="w")
 
-        self.quality_option = ctk.CTkOptionMenu(controls, values=[QUALITY_AUDIO_ONLY], height=40)
+        self.quality_option = ctk.CTkOptionMenu(controls, values=[QUALITY_AUDIO_ONLY], height=34, command=self.on_quality_changed)
         self.quality_option.set(QUALITY_AUDIO_ONLY)
         self.quality_option.grid(row=1, column=1, sticky="w", padx=(12, 0))
 
@@ -3530,14 +3533,14 @@ class TwitchFreedomApp(ctk.CTk):
         self._update_volume_label(2.0)
 
         actions = ctk.CTkFrame(hero, fg_color="transparent")
-        actions.grid(row=2, column=1, sticky="e", padx=18, pady=(0, 14))
-        self.start_button = ctk.CTkButton(actions, text="Start Audio", width=118, height=38, command=self.start_stream)
+        actions.grid(row=2, column=1, sticky="e", padx=16, pady=(0, 10))
+        self.start_button = ctk.CTkButton(actions, text="Start Audio", width=108, height=34, command=self.start_stream)
         self.start_button.pack(side="left", padx=(0, 12))
         self.stop_button = ctk.CTkButton(
             actions,
             text="Stop",
-            width=84,
-            height=38,
+            width=74,
+            height=34,
             fg_color="#3b1d2a",
             hover_color="#5a263b",
             state="disabled",
@@ -3547,7 +3550,7 @@ class TwitchFreedomApp(ctk.CTk):
 
         self.content = ctk.CTkFrame(main, fg_color="transparent")
         content = self.content
-        content.grid(row=2, column=0, sticky="nsew", pady=(22, 0))
+        content.grid(row=0, column=0, sticky="nsew")
         content.grid_columnconfigure(0, weight=3)
         content.grid_columnconfigure(1, weight=2)
         content.grid_rowconfigure(0, weight=1)
@@ -3750,11 +3753,32 @@ class TwitchFreedomApp(ctk.CTk):
                 self.quality_option.set(LOW_VIDEO_QUALITIES[0])
             self.start_button.configure(text="Start Low Video")
             self.log("Video mode selected.")
+            self.schedule_playback_restart()
             return
 
         self.quality_option.configure(values=[QUALITY_AUDIO_ONLY])
         self.quality_option.set(QUALITY_AUDIO_ONLY)
         self.start_button.configure(text="Start Audio")
+        self.schedule_playback_restart()
+
+    def on_quality_changed(self, _quality: str) -> None:
+        self.schedule_playback_restart()
+
+    def schedule_playback_restart(self) -> None:
+        if self.suppress_playback_restart or not (self.is_streaming or self.is_video_popped):
+            return
+        if self.playback_restart_after_id is not None:
+            self.after_cancel(self.playback_restart_after_id)
+        self.playback_restart_after_id = self.after(250, self.restart_stream_for_playback_selection)
+
+    def restart_stream_for_playback_selection(self) -> None:
+        self.playback_restart_after_id = None
+        if (not self.is_streaming and not self.is_video_popped) or self.stopping_stream:
+            return
+        mode = self.playback_mode_option.get()
+        quality = self.quality_option.get()
+        self.log(f"Applying playback selection: {mode} {quality}.")
+        self.start_stream(count_play=False, replace_active=True)
 
     def _update_volume_label(self, value: float) -> None:
         volume = float(value)
@@ -4128,7 +4152,12 @@ class TwitchFreedomApp(ctk.CTk):
             offered = ", ".join(available_video[:8])
             if len(available_video) > 8:
                 offered = f"{offered}, ..."
-            self.quality_option.set(resolved)
+            previous_suppression = self.suppress_playback_restart
+            self.suppress_playback_restart = True
+            try:
+                self.quality_option.set(resolved)
+            finally:
+                self.suppress_playback_restart = previous_suppression
             self.log(
                 f"{requested_quality} is unavailable for this stream; using closest supported quality {resolved}"
                 + (f" from: {offered}." if offered else ".")
@@ -4438,7 +4467,7 @@ class TwitchFreedomApp(ctk.CTk):
 
             self.main.grid_configure(row=0, column=0, columnspan=2, sticky="nsew", padx=0, pady=0)
             self.main.grid_rowconfigure(0, weight=1)
-            self.main.grid_rowconfigure(2, weight=0)
+            self.main.grid_rowconfigure(1, weight=0)
             self.content.grid_configure(row=0, column=0, sticky="nsew", pady=0)
             self.content.grid_columnconfigure(0, weight=1)
             self.content.grid_columnconfigure(1, weight=0)
@@ -4454,10 +4483,10 @@ class TwitchFreedomApp(ctk.CTk):
             self.video_surface.configure(corner_radius=0)
         else:
             self.main.grid_configure(row=0, column=1, columnspan=1, sticky="nsew", padx=26, pady=26)
-            self.main.grid_rowconfigure(0, weight=0)
-            self.main.grid_rowconfigure(2, weight=1)
-            self.hero.grid(row=0, column=0, sticky="ew")
-            self.content.grid_configure(row=2, column=0, sticky="nsew", pady=(22, 0))
+            self.main.grid_rowconfigure(0, weight=1)
+            self.main.grid_rowconfigure(1, weight=0)
+            self.hero.grid(row=1, column=0, sticky="ew", pady=(14, 0))
+            self.content.grid_configure(row=0, column=0, sticky="nsew", pady=0)
             self.content.grid_columnconfigure(0, weight=3)
             self.content.grid_columnconfigure(1, weight=2)
             self.video_shell.grid_configure(row=0, column=0, sticky="nsew", padx=(0, 12))
@@ -4652,9 +4681,14 @@ class TwitchFreedomApp(ctk.CTk):
         url, quality, volume = selected
         if quality == QUALITY_AUDIO_ONLY:
             quality = DEFAULT_VIDEO_QUALITY
-            self.quality_option.set(quality)
-            self.playback_mode_option.set(PLAYBACK_LOW_VIDEO)
-            self.on_playback_mode_changed(PLAYBACK_LOW_VIDEO)
+            previous_suppression = self.suppress_playback_restart
+            self.suppress_playback_restart = True
+            try:
+                self.quality_option.set(quality)
+                self.playback_mode_option.set(PLAYBACK_LOW_VIDEO)
+                self.on_playback_mode_changed(PLAYBACK_LOW_VIDEO)
+            finally:
+                self.suppress_playback_restart = previous_suppression
 
         if not self._check_playback_tools():
             return False
@@ -4762,6 +4796,9 @@ class TwitchFreedomApp(ctk.CTk):
                 return
         self.stopping_stream = True
         self.cancel_volume_restart()
+        if self.playback_restart_after_id is not None:
+            self.after_cancel(self.playback_restart_after_id)
+            self.playback_restart_after_id = None
         if self.video_restart_after_id is not None:
             self.after_cancel(self.video_restart_after_id)
             self.video_restart_after_id = None
@@ -4963,6 +5000,7 @@ class TwitchFreedomApp(ctk.CTk):
 
     def load_record(self, record: StreamRecord) -> None:
         self.suppress_volume_restart = True
+        self.suppress_playback_restart = True
         try:
             self.url_entry.delete(0, "end")
             self.url_entry.insert(0, record.url)
@@ -4973,6 +5011,7 @@ class TwitchFreedomApp(ctk.CTk):
             self._update_volume_label(record.volume)
         finally:
             self.suppress_volume_restart = False
+            self.suppress_playback_restart = False
         self.log(f"Loaded saved stream: {record.title}")
 
     def play_record(self, record: StreamRecord) -> None:
