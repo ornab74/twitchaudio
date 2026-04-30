@@ -127,10 +127,11 @@ sudo apt install -y alsa-utils
 ```txt
 customtkinter==5.2.2
 cryptography==42.0.0
-streamlink==6.8.0
+streamlink==8.3.0
+nh3==0.3.5
 ```
 
-`bleach` is optional. When installed, it is used for stronger text sanitization. Without it, the app falls back to built-in HTML stripping.
+`nh3` is required for text sanitization. The app refuses to start without it.
 
 ## Install From A Local Checkout
 
@@ -415,8 +416,15 @@ python3 -m pip install -r requirements.txt
 If the app says `Missing tools: streamlink` or `Missing tools: ffplay`, reinstall dependencies and make sure both tools are on your `PATH`:
 
 ```bash
-python3 -m pip install -r requirements.txt
+python3 -m pip install --upgrade -r requirements.txt
 sudo apt install -y ffmpeg
+```
+
+The app prefers the `streamlink` executable installed next to the Python interpreter that launched it. If Twitch suddenly starts returning `No playable streams found`, upgrade that same environment so the Twitch plugin is current:
+
+```bash
+python3 -m pip install --upgrade streamlink
+streamlink --version
 ```
 
 If the GUI fails to open on Linux, install Tk support:

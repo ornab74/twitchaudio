@@ -35,19 +35,15 @@ try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.exceptions import InvalidTag
     from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+    import nh3
 except ModuleNotFoundError as exc:
     missing = exc.name or "a required package"
     print(f"Missing Python dependency: {missing}")
     if missing == "tkinter":
         print("On Ubuntu/Debian, install Tk support with: sudo apt install python3-tk")
     else:
-        print("Install Python dependencies with: python3 -m pip install .")
+        print("Install Python dependencies with: python3 -m pip install -r requirements.txt")
     sys.exit(1)
-
-try:
-    import bleach
-except ModuleNotFoundError:
-    bleach = None
 
 
 APP_NAME = "TwitchAudio"
@@ -160,6 +156,9 @@ VIDEO_CACHE_SECONDS = 90
 STREAMLINK_RINGBUFFER_SIZE = "256M"
 STREAMLINK_SEGMENT_THREADS = "4"
 STREAMLINK_QUALITY_PROBE_TIMEOUT_SECONDS = 15.0
+STREAMLINK_VERSION_TIMEOUT_SECONDS = 5.0
+MIN_STREAMLINK_VERSION = (8, 2, 1)
+MIN_STREAMLINK_VERSION_TEXT = ".".join(str(part) for part in MIN_STREAMLINK_VERSION)
 CHAT_SOCKET_TIMEOUT_SECONDS = 2.0
 CHAT_SEND_CONFIRM_SECONDS = 20.0
 ONLINE_STATUS_REFRESH_SECONDS = 300
@@ -225,6 +224,7 @@ SCIENCE_TECH_FALLBACK_QUERIES = (
     "Science & Technology",
     "Science and Technology",
     "science-and-technology",
+    "509670",
     "science",
     "technology",
     "NASA",
@@ -314,11 +314,73 @@ def sanitize_text(value: Any, max_chars: int = 500) -> str:
     text = str(value or "").replace("\x00", "").replace("\r", " ").replace("\n", " ")
     text = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text).strip()
     text = text[:max_chars]
-    if bleach is not None:
-        text = bleach.clean(text, tags=[], attributes={}, protocols=[], strip=True)
-    else:
-        text = re.sub(r"<[^>]*>", "", html.unescape(text))
-    return text.strip()
+    text = html.unescape(text)
+    return html.unescape(nh3.clean(text, tags=set(), attributes={})).strip()
+
+
+def _is_executable_file(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    return sys.platform.startswith("win") or os.access(path, os.X_OK)
+
+
+def resolve_command(command: str) -> str | None:
+    executable_dir = Path(sys.executable).absolute().parent
+    names = (f"{command}.exe", f"{command}.cmd", f"{command}.bat", command) if sys.platform.startswith("win") else (command,)
+    for name in names:
+        candidate = executable_dir / name
+        if _is_executable_file(candidate):
+            return str(candidate)
+    return shutil.which(command)
+
+
+def streamlink_executable() -> str | None:
+    return resolve_command("streamlink")
+
+
+def _parse_streamlink_version(value: str) -> tuple[int, ...] | None:
+    match = re.search(r"\bstreamlink\s+(\d+(?:\.\d+){1,3})", value, re.IGNORECASE)
+    if match is None:
+        return None
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def _version_at_least(current: tuple[int, ...], minimum: tuple[int, ...]) -> bool:
+    size = max(len(current), len(minimum))
+    return current + (0,) * (size - len(current)) >= minimum + (0,) * (size - len(minimum))
+
+
+def streamlink_environment_error() -> str | None:
+    executable = streamlink_executable()
+    if executable is None:
+        return "Install Streamlink in the app environment or make sure it is on your PATH."
+
+    try:
+        result = subprocess.run(
+            [executable, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=STREAMLINK_VERSION_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except Exception as exc:
+        return f"Could not run Streamlink at {executable}: {sanitize_text(exc, max_chars=180)}"
+
+    output = result.stdout or result.stderr
+    if result.returncode != 0:
+        detail = sanitize_text(output, max_chars=180)
+        return f"Could not run Streamlink at {executable}." + (f" {detail}" if detail else "")
+
+    version = _parse_streamlink_version(output)
+    if version is not None and not _version_at_least(version, MIN_STREAMLINK_VERSION):
+        current = ".".join(str(part) for part in version)
+        return (
+            f"Streamlink {current} is too old for current Twitch playback. "
+            f"Install Streamlink {MIN_STREAMLINK_VERSION_TEXT} or newer in the same Python environment used to launch {APP_NAME}."
+        )
+
+    return None
 
 
 def utc_now() -> str:
@@ -1688,7 +1750,7 @@ class TwitchOAuthManager:
         add_alias(slug)
         add_alias(slug.replace("-", " ").title())
         if category.lower().replace("&", "and").replace("-", " ") in {"science and technology", "science and technology"} or slug == "science-and-technology":
-            for alias in ("Science & Technology", "Science and Technology", "science-and-technology"):
+            for alias in ("Science & Technology", "Science and Technology", "science-and-technology", "509670"):
                 add_alias(alias)
         return aliases
 
@@ -1937,22 +1999,69 @@ class TwitchOAuthManager:
                     streams.append(record)
         return self._dedupe_streams(streams, limit)
 
-    def _streams_from_twitch_graphql_category(self, category: str, slug: str, limit: int) -> list[dict[str, str]]:
+    def _streams_from_twitch_graphql_category(
+        self,
+        category: str,
+        slug: str,
+        limit: int,
+        category_ids: list[str] | None = None,
+    ) -> list[dict[str, str]]:
         clean_category = sanitize_text(category, max_chars=80)
         clean_slug = sanitize_text(slug, max_chars=100).lower()
         clean_slug = re.sub(r"[^a-z0-9-]+", "-", clean_slug).strip("-")
         gql_queries: list[dict[str, Any]] = []
 
+        directory_names: list[str] = []
+
+        def add_directory_name(value: Any) -> None:
+            name = sanitize_text(value, max_chars=100)
+            if name and name.lower() not in {item.lower() for item in directory_names}:
+                directory_names.append(name)
+
+        add_directory_name(clean_category)
+        add_directory_name(clean_slug)
+        add_directory_name(clean_slug.replace("-", " ").title())
+        for category_id in category_ids or []:
+            add_directory_name(category_id)
+
         # Twitch's web directory is slug-driven, while Helix is category-id driven.
         # Some categories can come back empty through Helix in app tokens, so this
         # fallback asks the same public GraphQL endpoint used by Twitch's directory.
-        if clean_slug:
+        for directory_name in directory_names:
             gql_queries.append({
-                "operationName": "TwitchAudioDirectoryBySlug",
-                "variables": {"slug": clean_slug, "limit": max(1, min(limit, 100))},
+                "operationName": "TwitchAudioDirectoryByName",
+                "variables": {"name": directory_name, "limit": max(1, min(limit, 100))},
                 "query": """
-                query TwitchAudioDirectoryBySlug($slug: String!, $limit: Int!) {
-                  game(slug: $slug) {
+                query TwitchAudioDirectoryByName($name: String!, $limit: Int!) {
+                  directory(name: $name, type: GAME) {
+                    streams(first: $limit) {
+                      edges { node { title broadcaster { login displayName } } }
+                    }
+                  }
+                }
+                """,
+            })
+        for category_id in category_ids or []:
+            gql_queries.append({
+                "operationName": "TwitchAudioDirectoryById",
+                "variables": {"id": category_id, "limit": max(1, min(limit, 100))},
+                "query": """
+                query TwitchAudioDirectoryById($id: ID!, $limit: Int!) {
+                  game(id: $id) {
+                    streams(first: $limit, options: {sort: VIEWER_COUNT}) {
+                      edges { node { title broadcaster { login displayName } } }
+                    }
+                  }
+                }
+                """,
+            })
+        if clean_slug and clean_slug != self._category_slug_from_name(clean_category):
+            gql_queries.append({
+                "operationName": "TwitchAudioDirectoryBySlugAsName",
+                "variables": {"name": clean_slug.replace("-", " ").title(), "limit": max(1, min(limit, 100))},
+                "query": """
+                query TwitchAudioDirectoryBySlugAsName($name: String!, $limit: Int!) {
+                  game(name: $name) {
                     streams(first: $limit, options: {sort: VIEWER_COUNT}) {
                       edges { node { title broadcaster { login displayName } } }
                     }
@@ -1996,8 +2105,10 @@ class TwitchOAuthManager:
             if not isinstance(decoded, dict):
                 continue
             data = decoded.get("data")
-            game = data.get("game") if isinstance(data, dict) else None
-            stream_connection = game.get("streams") if isinstance(game, dict) else None
+            container = None
+            if isinstance(data, dict):
+                container = data.get("game") or data.get("directory")
+            stream_connection = container.get("streams") if isinstance(container, dict) else None
             edges = stream_connection.get("edges", []) if isinstance(stream_connection, dict) else []
             for edge in edges:
                 node = edge.get("node") if isinstance(edge, dict) else None
@@ -2104,7 +2215,7 @@ class TwitchOAuthManager:
             }
 
         for slug in self._category_slug_candidates(clean_category):
-            streams = self._streams_from_twitch_graphql_category(clean_category, slug, limit)
+            streams = self._streams_from_twitch_graphql_category(clean_category, slug, limit, category_ids)
             if streams:
                 return {"streams": streams, "next_cursor": "", "source": f"Twitch directory GraphQL {slug}"}
 
@@ -2943,7 +3054,7 @@ class ExploreWindow(ctk.CTkToplevel):
 
     def _play_stream(self, url: str) -> None:
         self._load_stream(url)
-        self.app.start_stream()
+        self.app.start_stream(replace_active=True)
 
 
 class TwitchChatReader:
@@ -3621,26 +3732,31 @@ class TwitchAudioApp(ctk.CTk):
         self.chat_status_label.configure(text=message, text_color=color)
         self.add_chat_line(message)
 
-    def connect_chat(self) -> None:
-        if self.chat_thread and self.chat_thread.is_alive():
-            self.set_chat_status("Already connected", "#72f2c7")
-            return
-
+    def connect_chat(self, show_setup_prompt: bool = True, quiet_if_same: bool = False) -> bool:
         channel = twitch_channel_from_url(self.url_entry.get())
         if not channel:
-            messagebox.showerror("Chat channel missing", "Enter a Twitch channel URL before connecting chat.")
-            return
+            if show_setup_prompt:
+                messagebox.showerror("Chat channel missing", "Enter a Twitch channel URL before connecting chat.")
+            return False
+
+        if self.chat_thread and self.chat_thread.is_alive():
+            if self.chat_channel == channel:
+                if not quiet_if_same:
+                    self.set_chat_status(f"Already connected to #{channel}", "#72f2c7")
+                return True
+            self.disconnect_chat(user_requested=False)
 
         try:
             nick, token = TwitchOAuthManager(self.history).get_chat_identity()
         except Exception as exc:
             self.set_chat_status("Chat auth not configured", "#ffb86c")
-            messagebox.showinfo(
-                "Chat settings required",
-                "Open Settings, save your Twitch Client ID and Client Secret, then generate a Twitch chat token.\n\n"
-                f"Detail: {exc}",
-            )
-            return
+            if show_setup_prompt:
+                messagebox.showinfo(
+                    "Chat settings required",
+                    "Open Settings, save your Twitch Client ID and Client Secret, then generate a Twitch chat token.\n\n"
+                    f"Detail: {exc}",
+                )
+            return False
 
         self.disconnect_chat(user_requested=False)
         self.chat_channel = channel
@@ -3650,6 +3766,7 @@ class TwitchAudioApp(ctk.CTk):
         self.chat_thread = threading.Thread(target=self.chat_reader.run, daemon=True)
         self.chat_thread.start()
         self.set_chat_status(f"Connecting to #{channel}...", "#8cbcff")
+        return True
 
     def disconnect_chat(self, user_requested: bool) -> None:
         if self.chat_stop_event:
@@ -3774,11 +3891,30 @@ class TwitchAudioApp(ctk.CTk):
         statuses = {channel.lower(): channel.lower() in online for channel in channels}
         self.event_queue.put(("online_statuses", json.dumps(statuses)))
 
+    def _check_playback_tools(self) -> bool:
+        streamlink_error = streamlink_environment_error()
+        missing = [tool for tool in ("ffplay",) if resolve_command(tool) is None]
+        if streamlink_error is None and not missing:
+            return True
+
+        messages: list[str] = []
+        if streamlink_error:
+            messages.append(streamlink_error)
+            self.log(streamlink_error)
+        if missing:
+            messages.append("Install these command line tools first: " + ", ".join(missing))
+            self.log("Missing dependency: " + ", ".join(missing))
+
+        messagebox.showerror("Playback tools unavailable", "\n".join(messages))
+        return False
+
     def _streamlink_available_qualities(self, url: str) -> tuple[str, ...]:
+        executable = streamlink_executable()
+        if executable is None:
+            raise RuntimeError("Streamlink is not installed in the app environment or on PATH.")
         command = [
-            "streamlink",
+            executable,
             "--json",
-            "--twitch-disable-ads",
             url,
         ]
         try:
@@ -3843,12 +3979,14 @@ class TwitchAudioApp(ctk.CTk):
         return resolved
 
     def _streamlink_command(self, url: str, quality: str) -> list[str]:
+        executable = streamlink_executable()
+        if executable is None:
+            raise RuntimeError("Streamlink is not installed in the app environment or on PATH.")
         return [
-            "streamlink",
+            executable,
             "--loglevel",
             "warning",
             "--stdout",
-            "--twitch-disable-ads",
             "--stream-segment-threads",
             STREAMLINK_SEGMENT_THREADS,
             "--stream-segment-attempts",
@@ -3871,7 +4009,7 @@ class TwitchAudioApp(ctk.CTk):
 
     def _ffplay_command(self, volume: float) -> list[str]:
         return [
-            "ffplay",
+            resolve_command("ffplay") or "ffplay",
             "-autoexit",
             "-nodisp",
             "-f",
@@ -3887,7 +4025,7 @@ class TwitchAudioApp(ctk.CTk):
 
     def _ffplay_video_command(self, volume: float, window_title: str) -> list[str]:
         return [
-            "ffplay",
+            resolve_command("ffplay") or "ffplay",
             "-autoexit",
             "-window_title",
             window_title,
@@ -4179,10 +4317,12 @@ class TwitchAudioApp(ctk.CTk):
             return None
         return url, quality, volume
 
-    def start_stream(self, count_play: bool = True) -> bool:
+    def start_stream(self, count_play: bool = True, replace_active: bool = False) -> bool:
         if self.is_streaming:
-            self.log("A stream is already running.")
-            return False
+            if not replace_active:
+                self.log("A stream is already running.")
+                return False
+            self.stop_stream(user_requested=False)
         if self.is_video_popped:
             self.stop_video_popout(user_requested=False)
         self.video_restart_attempts = 0
@@ -4198,14 +4338,7 @@ class TwitchAudioApp(ctk.CTk):
             messagebox.showerror("Unsafe quality", "Use audio_only in Audio mode, or choose a listed resolution in Video mode.")
             return False
 
-        required_tools = ("streamlink", "ffplay")
-        missing = [tool for tool in required_tools if shutil.which(tool) is None]
-        if missing:
-            messagebox.showerror(
-                "Missing tools",
-                "Install these command line tools first: " + ", ".join(missing),
-            )
-            self.log("Missing dependency: " + ", ".join(missing))
+        if not self._check_playback_tools():
             return False
 
         if video_mode:
@@ -4258,6 +4391,7 @@ class TwitchAudioApp(ctk.CTk):
 
         monitor = threading.Thread(target=self.monitor_stream, args=(url,), daemon=True)
         monitor.start()
+        self.connect_chat(show_setup_prompt=False, quiet_if_same=True)
         return True
 
     def _start_embedded_video_pipe(self, url: str, quality: str, volume: float) -> None:
@@ -4326,10 +4460,7 @@ class TwitchAudioApp(ctk.CTk):
             self.playback_mode_option.set(PLAYBACK_LOW_VIDEO)
             self.on_playback_mode_changed(PLAYBACK_LOW_VIDEO)
 
-        missing = [tool for tool in ("streamlink", "ffplay") if shutil.which(tool) is None]
-        if missing:
-            messagebox.showerror("Missing tools", "Install these command line tools first: " + ", ".join(missing))
-            self.log("Missing dependency: " + ", ".join(missing))
+        if not self._check_playback_tools():
             return False
 
         try:
@@ -4597,14 +4728,8 @@ class TwitchAudioApp(ctk.CTk):
                     send_id = sanitize_text(payload.get("send_id"), max_chars=80)
                     if not self.finish_pending_chat_send(send_id):
                         continue
-                    channel = twitch_channel_from_url(str(payload.get("channel") or ""))
-                    if channel is None:
-                        channel = sanitize_chat_user(payload.get("channel"))
                     message = sanitize_chat_message(payload.get("message"))
                     if message:
-                        if channel and channel != "unknown":
-                            self.queue_chat_save(channel, "You", message, "out")
-                        self.add_chat_line(f"You: {message}")
                         self.chat_status_label.configure(text="Message sent", text_color="#72f2c7")
                 elif event == "chat_send_failed":
                     try:
@@ -4654,7 +4779,7 @@ class TwitchAudioApp(ctk.CTk):
 
     def play_record(self, record: StreamRecord) -> None:
         self.load_record(record)
-        self.start_stream()
+        self.start_stream(replace_active=True)
 
     def delete_record(self, record: StreamRecord) -> None:
         if messagebox.askyesno("Delete saved stream", f"Delete {record.title} from encrypted history?"):
