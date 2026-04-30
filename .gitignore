@@ -29,7 +29,7 @@ pip-wheel-metadata/
 *.db-journal
 *.db-wal
 *.db-shm
-.twitchaudio/
+.twitchfreedom/
 
 # Local editor/tool state
 .idea/

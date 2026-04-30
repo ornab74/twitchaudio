@@ -7,7 +7,6 @@ It is built for people who want Twitch playback without keeping a full browser t
 
 The current implementation lives in `main.py`.
 
-> Note: the code may still contain legacy internal names such as `TwitchAudio` for app directories, window titles, or migration compatibility. This README uses the new product name: **Twitch Freedom**.
 <img width="1628" height="1144" alt="demotwitchfreedom" src="https://github.com/user-attachments/assets/a16824bf-c6bb-4c8b-a700-c10a0f51f8c3" />
 
 ## Feature Overview
@@ -51,6 +50,7 @@ mindmap
 - Streamlink version check with a minimum supported version of `8.2.1`.
 - Audio-only playback through Streamlink's `audio_only` stream.
 - Video playback with selectable quality: `160p`, `360p`, `480p`, `720p`, `720p60`, `1080p`, `1080p60`, and `best`.
+- In-app FFplay video docking on Linux/X11, with external FFplay windows on Windows, macOS, Wayland, or other non-X11 desktops.
 - Dark CustomTkinter interface with stream controls, saved-stream cards, status text, diagnostics, settings, video controls, Explore, and chat controls.
 - Sidebar logo loaded from `logo.png`.
 - Saved stream list with play counts, last-played timestamps, playback mode, quality, and volume.
@@ -385,6 +385,8 @@ Audio-only mode asks Streamlink for the `audio_only` variant and pipes it into `
 
 Video mode lets Streamlink play the selected quality through `ffplay`. Available stream variants depend on the live Twitch channel and what Twitch exposes through Streamlink.
 
+On Linux/X11, Twitch Freedom attempts to dock the FFplay video window inside the app. On Windows, macOS, Wayland, or any desktop where X11 docking is unavailable, Twitch Freedom keeps the same Streamlink-to-FFplay playback pipeline but lets FFplay open in its own native window. Use FFplay's window controls, or press `F` while the FFplay window is focused, for fullscreen on those platforms.
+
 Changing volume may briefly interrupt playback because `ffplay` receives volume as a startup audio filter. Twitch Freedom restarts playback when needed so the new volume takes effect.
 
 ## Stream List and Explore
@@ -440,18 +442,31 @@ Twitch Freedom supports two chat modes:
 
 ### Create a Twitch Developer Application
 
-1. Go to the Twitch Developer Console.
-2. Create or register an application.
-3. Copy the **Client ID**.
-4. Create and copy the **Client Secret**.
-5. Open Twitch Freedom.
-6. Open **Settings**.
-7. Paste the Client ID and Client Secret.
-8. Click **Save App**.
-9. Click **Generate Token**.
-10. Open the displayed verification URL in a browser.
-11. Enter the displayed user code.
-12. Return to Twitch Freedom after authorization completes.
+Official Twitch guide: [Register Your App](https://dev.twitch.tv/docs/authentication/register-app/).
+
+1. Open the [Twitch Developer Console](https://dev.twitch.tv/console/apps).
+2. Sign in with your Twitch account.
+3. Enable Twitch account email verification and 2FA if Twitch requires it.
+4. Open **Applications**.
+5. Click **Register Your Application**.
+6. Set **Name** to something unique, for example `Twitch Freedom YourName`.
+7. Set **OAuth Redirect URLs** to `http://localhost:3000`.
+8. Click **Add** next to the redirect URL.
+9. Set **Category** to **Desktop App**, **Application Integration**, or the closest available app category.
+10. Complete the captcha if Twitch asks for it.
+11. Click **Create**.
+12. Back on the application list, click **Manage** for the app.
+13. Copy the **Client ID**.
+14. Click **New Secret**, then copy the **Client Secret** immediately.
+15. Open Twitch Freedom.
+16. Open **Settings**.
+17. Paste the Client ID and Client Secret.
+18. Click **Save App**.
+19. Click **Generate Token**.
+20. Click **Open Twitch Device Page**.
+21. Click **Copy** next to the code in Twitch Freedom.
+22. Paste the code into the Twitch device page and approve the app.
+23. Return to Twitch Freedom after authorization completes.
 
 Twitch Freedom requests these chat scopes:
 
@@ -460,6 +475,13 @@ chat:read user:write:chat
 ```
 
 The app stores Twitch credentials and OAuth tokens encrypted in the local vault. It refreshes access tokens automatically when they are near expiry.
+
+Notes:
+
+- Twitch says each app should have its own Client ID.
+- Treat the Client Secret like a password.
+- The redirect URL is still required by Twitch app registration even though Twitch Freedom uses the device-code flow for login.
+- Twitch Freedom uses the device-code OAuth flow documented by Twitch in [Getting OAuth Access Tokens](https://dev.twitch.tv/docs/authentication/getting-tokens-oauth/).
 
 ## Twitch Chat Flow
 
@@ -494,11 +516,11 @@ Default locations in the current implementation:
 
 | OS | Location |
 | --- | --- |
-| Linux | `$XDG_DATA_HOME/twitchaudio/history.sqlite3` or `~/.local/share/twitchaudio/history.sqlite3` |
-| macOS | `~/Library/Application Support/TwitchAudio/history.sqlite3` |
-| Windows | `%APPDATA%\\TwitchAudio\\history.sqlite3` |
+| Linux | `$XDG_DATA_HOME/twitchfreedom/history.sqlite3` or `~/.local/share/twitchfreedom/history.sqlite3` |
+| macOS | `~/Library/Application Support/TwitchFreedom/history.sqlite3` |
+| Windows | `%APPDATA%\\TwitchFreedom\\history.sqlite3` |
 
-If an older `~/.twitchaudio` directory already exists, the app keeps using it so existing local data remains available.
+If a pre-rename data directory already exists, Twitch Freedom migrates it to the new data location when possible so existing local data remains available.
 
 The SQLite database contains these logical areas:
 

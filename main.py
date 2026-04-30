@@ -46,7 +46,11 @@ except ModuleNotFoundError as exc:
     sys.exit(1)
 
 
-APP_NAME = "TwitchAudio"
+APP_NAME = "Twitch Freedom"
+APP_COMPACT_NAME = "TwitchFreedom"
+APP_SLUG = "twitchfreedom"
+OLD_APP_COMPACT_NAME = "Twitch" + "Audio"
+OLD_APP_SLUG = "twitch" + "audio"
 DEFAULT_STREAM_URL = "https://www.twitch.tv/beardhero"
 EXPECTED_LOGO_SHA256 = "d1f56736caa9f9cd80361aba9fb0bc8773df42653f4668a9d6a16752eb02bd86"
 LOGO_FILENAMES = (f"{EXPECTED_LOGO_SHA256}.png", "logo.png")
@@ -70,26 +74,52 @@ def find_verified_logo_path() -> Path | None:
         except OSError:
             continue
     return None
-LEGACY_APP_DIR = Path.home() / ".twitchaudio"
 
 
-def get_app_dir() -> Path:
-    if LEGACY_APP_DIR.exists():
-        return LEGACY_APP_DIR
-
+def platform_app_dir(app_dir_name: str, app_slug: str) -> Path:
     if sys.platform.startswith("win"):
         appdata = os.environ.get("APPDATA")
         if appdata:
-            return Path(appdata) / APP_NAME
+            return Path(appdata) / app_dir_name
 
     if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / APP_NAME
+        return Path.home() / "Library" / "Application Support" / app_dir_name
 
     xdg_data_home = os.environ.get("XDG_DATA_HOME")
     if xdg_data_home:
-        return Path(xdg_data_home) / "twitchaudio"
+        return Path(xdg_data_home) / app_slug
 
-    return Path.home() / ".local" / "share" / "twitchaudio"
+    return Path.home() / ".local" / "share" / app_slug
+
+
+def legacy_app_dirs() -> list[Path]:
+    candidates = [
+        Path.home() / f".{OLD_APP_SLUG}",
+        platform_app_dir(OLD_APP_COMPACT_NAME, OLD_APP_SLUG),
+    ]
+    unique: list[Path] = []
+    for candidate in candidates:
+        if candidate not in unique:
+            unique.append(candidate)
+    return unique
+
+
+def get_app_dir() -> Path:
+    current = platform_app_dir(APP_COMPACT_NAME, APP_SLUG)
+    if current.exists():
+        return current
+
+    for legacy in legacy_app_dirs():
+        if not legacy.exists():
+            continue
+        try:
+            current.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(legacy), str(current))
+            return current
+        except OSError:
+            return legacy
+
+    return current
 
 
 APP_DIR = get_app_dir()
@@ -98,7 +128,8 @@ SALT_BYTES = 16
 SCRYPT_N = 2**15
 SCRYPT_R = 8
 SCRYPT_P = 1
-VERIFY_TEXT = b"twitchaudio-history-v1"
+VERIFY_TEXT = b"twitchfreedom-history-v1"
+OLD_VERIFY_TEXTS = ((OLD_APP_SLUG + "-history-v1").encode("utf-8"),)
 AES_ENVELOPE_MAGIC = b"TAG1"
 MAX_HISTORY = 80
 TWITCH_IRC_HOST = "irc.chat.twitch.tv"
@@ -171,6 +202,7 @@ PROCESS_MONITOR_INTERVAL_SECONDS = 3.0
 PROCESS_HEARTBEAT_SECONDS = 30.0
 DIAGNOSTIC_LOG_INTERVAL_SECONDS = 1.5
 VIDEO_READY_MESSAGE = "Video is ready. Choose Video mode and a resolution. FFplay is used for audio and video playback; double-click the in-app video for fullscreen."
+VIDEO_EXTERNAL_MESSAGE = "Video is ready. Choose Video mode and a resolution. On this platform, FFplay opens in its own window."
 TWITCH_CATEGORY_IDS = {
     "Software and Game Development": "1469308723",
     "Science & Technology": "509670",
@@ -244,6 +276,14 @@ X11_CURRENT_TIME = 0
 X11_REVERT_TO_PARENT = 2
 _X11_LIBRARY: ctypes.CDLL | None = None
 _X11_LIBRARY_CHECKED = False
+
+
+def supports_x11_video_docking() -> bool:
+    return sys.platform.startswith("linux") and bool(os.environ.get("DISPLAY"))
+
+
+def video_ready_message() -> str:
+    return VIDEO_READY_MESSAGE if supports_x11_video_docking() else VIDEO_EXTERNAL_MESSAGE
 
 
 class XKeyEvent(ctypes.Structure):
@@ -495,6 +535,9 @@ def closest_video_quality(requested: str, available: list[str] | tuple[str, ...]
 
 def _load_x11() -> ctypes.CDLL | None:
     global _X11_LIBRARY, _X11_LIBRARY_CHECKED
+    if not supports_x11_video_docking():
+        _X11_LIBRARY_CHECKED = True
+        return None
     if _X11_LIBRARY_CHECKED:
         return _X11_LIBRARY
 
@@ -1009,8 +1052,12 @@ class EncryptedHistoryStore:
             self.aes_key = key
             verifier = self._get_meta("verifier") or ""
             verifier_blob = base64.b64decode(verifier.encode("ascii"))
-            if self._decrypt_bytes(verifier_blob, b"meta:verifier") != VERIFY_TEXT:
+            decrypted_verifier = self._decrypt_bytes(verifier_blob, b"meta:verifier")
+            if decrypted_verifier != VERIFY_TEXT and decrypted_verifier not in OLD_VERIFY_TEXTS:
                 raise ValueError
+            if decrypted_verifier != VERIFY_TEXT:
+                self._set_meta("verifier", base64.b64encode(self._encrypt_bytes(VERIFY_TEXT, b"meta:verifier")).decode("ascii"))
+                self.connection.commit()
         except (ValueError, TypeError, KeyError, binascii.Error) as exc:
             self.close()
             raise ValueError("That password could not unlock this history vault.") from exc
@@ -2029,10 +2076,10 @@ class TwitchOAuthManager:
         # fallback asks the same public GraphQL endpoint used by Twitch's directory.
         for directory_name in directory_names:
             gql_queries.append({
-                "operationName": "TwitchAudioDirectoryByName",
+                "operationName": "TwitchFreedomDirectoryByName",
                 "variables": {"name": directory_name, "limit": max(1, min(limit, 100))},
                 "query": """
-                query TwitchAudioDirectoryByName($name: String!, $limit: Int!) {
+                query TwitchFreedomDirectoryByName($name: String!, $limit: Int!) {
                   directory(name: $name, type: GAME) {
                     streams(first: $limit) {
                       edges { node { title broadcaster { login displayName } } }
@@ -2043,10 +2090,10 @@ class TwitchOAuthManager:
             })
         for category_id in category_ids or []:
             gql_queries.append({
-                "operationName": "TwitchAudioDirectoryById",
+                "operationName": "TwitchFreedomDirectoryById",
                 "variables": {"id": category_id, "limit": max(1, min(limit, 100))},
                 "query": """
-                query TwitchAudioDirectoryById($id: ID!, $limit: Int!) {
+                query TwitchFreedomDirectoryById($id: ID!, $limit: Int!) {
                   game(id: $id) {
                     streams(first: $limit, options: {sort: VIEWER_COUNT}) {
                       edges { node { title broadcaster { login displayName } } }
@@ -2057,10 +2104,10 @@ class TwitchOAuthManager:
             })
         if clean_slug and clean_slug != self._category_slug_from_name(clean_category):
             gql_queries.append({
-                "operationName": "TwitchAudioDirectoryBySlugAsName",
+                "operationName": "TwitchFreedomDirectoryBySlugAsName",
                 "variables": {"name": clean_slug.replace("-", " ").title(), "limit": max(1, min(limit, 100))},
                 "query": """
-                query TwitchAudioDirectoryBySlugAsName($name: String!, $limit: Int!) {
+                query TwitchFreedomDirectoryBySlugAsName($name: String!, $limit: Int!) {
                   game(name: $name) {
                     streams(first: $limit, options: {sort: VIEWER_COUNT}) {
                       edges { node { title broadcaster { login displayName } } }
@@ -2071,10 +2118,10 @@ class TwitchOAuthManager:
             })
         if clean_category:
             gql_queries.append({
-                "operationName": "TwitchAudioDirectoryByName",
+                "operationName": "TwitchFreedomDirectoryByName",
                 "variables": {"name": clean_category, "limit": max(1, min(limit, 100))},
                 "query": """
-                query TwitchAudioDirectoryByName($name: String!, $limit: Int!) {
+                query TwitchFreedomDirectoryByName($name: String!, $limit: Int!) {
                   game(name: $name) {
                     streams(first: $limit, options: {sort: VIEWER_COUNT}) {
                       edges { node { title broadcaster { login displayName } } }
@@ -2092,7 +2139,7 @@ class TwitchOAuthManager:
                 headers={
                     "Client-Id": TWITCH_WEB_CLIENT_ID,
                     "Content-Type": "application/json",
-                    "User-Agent": "Mozilla/5.0 TwitchAudio/1.0",
+                    "User-Agent": "Mozilla/5.0 TwitchFreedom/1.0",
                 },
                 method="POST",
             )
@@ -2294,7 +2341,7 @@ class PasswordDialog(ctk.CTkToplevel):
         self.result: str | None = None
         self.first_run = first_run
 
-        self.title("Unlock TwitchAudio")
+        self.title("Unlock Twitch Freedom")
         self.geometry("440x360" if first_run else "440x300")
         self.resizable(False, False)
         self.configure(fg_color="#090b13")
@@ -2314,7 +2361,7 @@ class PasswordDialog(ctk.CTkToplevel):
 
         ctk.CTkLabel(
             panel,
-            text="TwitchAudio",
+            text="Twitch Freedom",
             font=ctk.CTkFont(size=15, weight="bold"),
             text_color="#8cbcff",
         ).pack(anchor="w", padx=24, pady=(24, 2))
@@ -2445,9 +2492,11 @@ class SettingsDialog(ctk.CTkToplevel):
         self.history = history
         self.oauth = TwitchOAuthManager(history)
         self.auth_stop_event: threading.Event | None = None
+        self.device_verification_uri = ""
+        self.device_user_code = ""
 
-        self.title("TwitchAudio Settings")
-        self.geometry("640x680")
+        self.title("Twitch Freedom Settings")
+        self.geometry("640x720")
         self.resizable(False, False)
         self.configure(fg_color="#090b13")
         self._grab_attempts = 0
@@ -2470,7 +2519,7 @@ class SettingsDialog(ctk.CTkToplevel):
         ).pack(anchor="w", padx=24, pady=(24, 4))
         ctk.CTkLabel(
             panel,
-            text="Save your Twitch Client ID and Client Secret. TwitchAudio stores them, OAuth tokens, refresh tokens, and chat transcripts as AES-GCM encrypted vault payloads.",
+            text="Save your Twitch Client ID and Client Secret. Twitch Freedom stores them, OAuth tokens, refresh tokens, and chat transcripts as AES-GCM encrypted vault payloads.",
             font=ctk.CTkFont(size=13),
             text_color="#a7b0c8",
             wraplength=560,
@@ -2513,6 +2562,7 @@ class SettingsDialog(ctk.CTkToplevel):
 
         code_box = ctk.CTkFrame(panel, fg_color="#080a12", corner_radius=12, border_width=1, border_color="#24304a")
         code_box.pack(fill="x", padx=24, pady=(12, 0))
+        code_box.grid_columnconfigure(0, weight=1)
         self.code_label = ctk.CTkLabel(
             code_box,
             text="Generate a Twitch login code after saving credentials.",
@@ -2521,7 +2571,36 @@ class SettingsDialog(ctk.CTkToplevel):
             wraplength=540,
             justify="left",
         )
-        self.code_label.pack(anchor="w", padx=16, pady=14)
+        self.code_label.grid(row=0, column=0, columnspan=3, sticky="ew", padx=16, pady=(14, 8))
+        self.device_link_button = ctk.CTkButton(
+            code_box,
+            text="Open Twitch Device Page",
+            height=32,
+            fg_color="#26304a",
+            hover_color="#34405f",
+            state="disabled",
+            command=self.open_device_verification_uri,
+        )
+        self.device_link_button.grid(row=1, column=0, sticky="ew", padx=(16, 8), pady=(0, 14))
+        self.device_code_entry = ctk.CTkEntry(
+            code_box,
+            placeholder_text="Code",
+            height=32,
+            justify="center",
+            state="disabled",
+        )
+        self.device_code_entry.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=(0, 14))
+        self.copy_code_button = ctk.CTkButton(
+            code_box,
+            text="Copy",
+            width=72,
+            height=32,
+            fg_color="#26304a",
+            hover_color="#34405f",
+            state="disabled",
+            command=self.copy_device_code,
+        )
+        self.copy_code_button.grid(row=1, column=2, sticky="e", padx=(0, 16), pady=(0, 14))
 
         actions = ctk.CTkFrame(panel, fg_color="transparent")
         actions.pack(fill="x", padx=24, pady=(18, 0))
@@ -2570,6 +2649,34 @@ class SettingsDialog(ctk.CTkToplevel):
     def toggle_secret_visibility(self) -> None:
         self.client_secret_entry.configure(show="" if self.show_secret_var.get() else "*")
 
+    def _set_device_code(self, code: str) -> None:
+        self.device_user_code = sanitize_text(code, max_chars=64)
+        self.device_code_entry.configure(state="normal")
+        self.device_code_entry.delete(0, "end")
+        if self.device_user_code:
+            self.device_code_entry.insert(0, self.device_user_code)
+            self.device_code_entry.configure(state="readonly")
+            self.copy_code_button.configure(state="normal")
+        else:
+            self.device_code_entry.configure(state="disabled")
+            self.copy_code_button.configure(state="disabled")
+
+    def open_device_verification_uri(self) -> None:
+        if not self.device_verification_uri:
+            return
+        try:
+            webbrowser.open(self.device_verification_uri)
+            self.status_label.configure(text="Opened Twitch device page in your browser.", text_color="#8cbcff")
+        except Exception as exc:
+            self.status_label.configure(text=f"Could not open browser: {exc}", text_color="#ff7a90")
+
+    def copy_device_code(self) -> None:
+        if not self.device_user_code:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(self.device_user_code)
+        self.status_label.configure(text="Copied Twitch device code.", text_color="#72f2c7")
+
     def save_app(self) -> bool:
         client_id = sanitize_text(self.client_id_entry.get(), max_chars=128)
         client_secret = sanitize_text(self.client_secret_entry.get(), max_chars=256)
@@ -2600,8 +2707,11 @@ class SettingsDialog(ctk.CTkToplevel):
             return
 
         self.auth_stop_event = threading.Event()
+        self.device_verification_uri = sanitize_text(device.verification_uri, max_chars=300)
+        self._set_device_code(device.user_code)
+        self.device_link_button.configure(state="normal" if self.device_verification_uri else "disabled")
         self.code_label.configure(
-            text=f"Open: {device.verification_uri}\nEnter code: {device.user_code}\nWaiting for approval..."
+            text="Open the Twitch device page, enter the code, then approve Twitch Freedom."
         )
         self.status_label.configure(text="Waiting for Twitch device approval...", text_color="#8cbcff")
         worker = threading.Thread(
@@ -2630,6 +2740,8 @@ class SettingsDialog(ctk.CTkToplevel):
         login = sanitize_chat_user(state.get("login"))
         self.status_label.configure(text=f"Authorized as {login}. Tokens are encrypted.", text_color="#72f2c7")
         self.code_label.configure(text="Twitch chat login is ready. Access and refresh tokens are stored encrypted.")
+        self.device_link_button.configure(state="disabled")
+        self.copy_code_button.configure(state="disabled")
 
     def clear(self) -> None:
         if self.auth_stop_event:
@@ -2640,6 +2752,9 @@ class SettingsDialog(ctk.CTkToplevel):
         self.client_secret_entry.delete(0, "end")
         self.status_label.configure(text="Cleared Twitch credentials and tokens.", text_color="#ffb86c")
         self.code_label.configure(text="Generate a Twitch login code after saving credentials.")
+        self.device_verification_uri = ""
+        self._set_device_code("")
+        self.device_link_button.configure(state="disabled")
 
     def _close(self) -> None:
         if self.auth_stop_event:
@@ -2652,7 +2767,7 @@ class StreamCard(ctk.CTkFrame):
         self,
         master: ctk.CTkFrame,
         record: StreamRecord,
-        app: "TwitchAudioApp",
+        app: "TwitchFreedomApp",
         compact: bool = False,
         online_status: bool | None = None,
     ) -> None:
@@ -2753,7 +2868,7 @@ class ExploreWindow(ctk.CTkToplevel):
         "Special Events",
     )
 
-    def __init__(self, master: "TwitchAudioApp", oauth: TwitchOAuthManager) -> None:
+    def __init__(self, master: "TwitchFreedomApp", oauth: TwitchOAuthManager) -> None:
         super().__init__(master)
         self.app = master
         self.oauth = oauth
@@ -3148,7 +3263,7 @@ class TwitchChatReader:
             self.sock.sendall(f"{command}\r\n".encode("utf-8"))
 
 
-class TwitchAudioApp(ctk.CTk):
+class TwitchFreedomApp(ctk.CTk):
     def __init__(self, history: EncryptedHistoryStore) -> None:
         super().__init__()
         self.history = history
@@ -3185,6 +3300,7 @@ class TwitchAudioApp(ctk.CTk):
         self.video_last_url = ""
         self.video_last_quality = ""
         self.video_last_volume = 2.0
+        self.video_uses_external_window = False
         self.stopping_stream = False
         self.stream_health = "Idle"
         self.process_log_tails: dict[str, list[str]] = {}
@@ -3193,7 +3309,7 @@ class TwitchAudioApp(ctk.CTk):
         self.chat_line_count = 0
         self.fullscreen_video = False
 
-        self.title("TwitchAudio Command Deck")
+        self.title("Twitch Freedom Command Deck")
         self.geometry("1180x760")
         self.minsize(980, 650)
         self.configure(fg_color="#080a12")
@@ -3435,7 +3551,7 @@ class TwitchAudioApp(ctk.CTk):
         video_panel.grid_rowconfigure(1, weight=1)
         self.video_status_label = ctk.CTkLabel(
             video_panel,
-            text=VIDEO_READY_MESSAGE,
+            text=video_ready_message(),
             font=ctk.CTkFont(size=13),
             text_color="#a7b0c8",
             wraplength=640,
@@ -3448,14 +3564,18 @@ class TwitchAudioApp(ctk.CTk):
         self.video_surface.bind("<Configure>", self.resize_docked_video)
         video_placeholder = ctk.CTkLabel(
             self.video_surface,
-            text="Double-click video for fullscreen",
+            text="Double-click video for fullscreen" if supports_x11_video_docking() else "FFplay opens in its own window",
             text_color="#6f7a92",
         )
         video_placeholder.pack(expand=True)
         video_placeholder.bind("<Double-Button-1>", self.toggle_ffplay_fullscreen)
         self.video_hint_label = ctk.CTkLabel(
             video_panel,
-            text="Start Video uses FFplay by default. On X11 it docks into this panel; double-click the video to toggle FFplay fullscreen.",
+            text=(
+                "Start Video uses FFplay by default. On X11 it docks into this panel; double-click the video to toggle FFplay fullscreen."
+                if supports_x11_video_docking()
+                else "Start Video uses FFplay in an external window on this platform. Use the FFplay window controls for fullscreen."
+            ),
             font=ctk.CTkFont(size=12),
             text_color="#6f7a92",
             wraplength=640,
@@ -3574,7 +3694,7 @@ class TwitchAudioApp(ctk.CTk):
 
         self.log_window = ctk.CTkToplevel(self)
         self.diagnostics_visible = True
-        self.log_window.title("TwitchAudio Diagnostics")
+        self.log_window.title("Twitch Freedom Diagnostics")
         self.log_window.geometry("720x460")
         self.log_window.configure(fg_color="#090b13")
         self.log_window.protocol("WM_DELETE_WINDOW", self._close_diagnostics)
@@ -4043,6 +4163,13 @@ class TwitchAudioApp(ctk.CTk):
     def _embedded_ffplay_command(self, volume: float, window_title: str) -> list[str]:
         return self._ffplay_video_command(volume, window_title)
 
+    def _external_video_window_detail(self) -> str:
+        if sys.platform.startswith("win"):
+            return "FFplay is running in a Windows window. Use that window's fullscreen controls or press F while it is focused."
+        if sys.platform == "darwin":
+            return "FFplay is running in a macOS window. Use that window's fullscreen controls or press F while it is focused."
+        return "FFplay is running in its own window because X11 docking is unavailable."
+
     def _start_stderr_drain(self, process: subprocess.Popen[bytes] | None, name: str) -> None:
         if process is None or process.stderr is None:
             return
@@ -4082,6 +4209,8 @@ class TwitchAudioApp(ctk.CTk):
         return raw.decode("utf-8", errors="replace").strip()[-1200:]
 
     def resize_docked_video(self, _event: object | None = None) -> None:
+        if not supports_x11_video_docking():
+            return
         if self.docked_video_window_id is None or self.ffplay_video_fullscreen:
             return
         resize_x11_window(
@@ -4098,6 +4227,14 @@ class TwitchAudioApp(ctk.CTk):
         height: int,
         window_title: str,
     ) -> None:
+        if not supports_x11_video_docking():
+            def external_finish() -> None:
+                if self.video_play_process is process and self.is_video_popped:
+                    self.video_status_label.configure(text=self._external_video_window_detail(), text_color="#a7b0c8")
+                    self.log("FFplay external video window active.")
+
+            self.after(0, external_finish)
+            return
         window_id = dock_x11_window_for_pid(process.pid, parent_window_id, width, height, window_title)
 
         def finish() -> None:
@@ -4128,6 +4265,14 @@ class TwitchAudioApp(ctk.CTk):
         height: int,
         window_title: str,
     ) -> None:
+        if not supports_x11_video_docking():
+            def external_finish() -> None:
+                if self.embedded_video_process is process and self.is_streaming:
+                    self.video_status_label.configure(text=self._external_video_window_detail(), text_color="#a7b0c8")
+                    self.log("FFplay external video window active.")
+
+            self.after(0, external_finish)
+            return
         window_id = dock_x11_window_for_pid(process.pid, parent_window_id, width, height, window_title)
 
         def finish() -> None:
@@ -4151,6 +4296,8 @@ class TwitchAudioApp(ctk.CTk):
         self.after(0, finish)
 
     def _start_ffplay_double_click_watcher(self, window_id: int) -> None:
+        if not supports_x11_video_docking():
+            return
         def on_double_click() -> None:
             self.after(0, self.toggle_ffplay_fullscreen)
 
@@ -4162,6 +4309,16 @@ class TwitchAudioApp(ctk.CTk):
 
 
     def toggle_ffplay_fullscreen(self, _event: object | None = None) -> None:
+        if not supports_x11_video_docking():
+            if not self.is_streaming and not self.is_video_popped:
+                self.video_status_label.configure(
+                    text="Start Video first. On this platform FFplay opens in its own window.",
+                    text_color="#ffb86c",
+                )
+                return
+            self.video_status_label.configure(text=self._external_video_window_detail(), text_color="#a7b0c8")
+            self.log("Fullscreen is handled by the external FFplay window on this platform.")
+            return
         if self.docked_video_window_id is None:
             if not self.is_streaming and not self.is_video_popped:
                 self.video_status_label.configure(
@@ -4227,7 +4384,7 @@ class TwitchAudioApp(ctk.CTk):
         self.fullscreen_video = False
         self.attributes("-fullscreen", False)
         self._set_video_only_fullscreen(False)
-        self.video_status_label.configure(text=VIDEO_READY_MESSAGE, text_color="#a7b0c8")
+        self.video_status_label.configure(text=video_ready_message(), text_color="#a7b0c8")
         self.log("Video fullscreen disabled.")
 
     def _set_video_only_fullscreen(self, enabled: bool) -> None:
@@ -4398,6 +4555,7 @@ class TwitchAudioApp(ctk.CTk):
         self.video_last_url = url
         self.video_last_quality = quality
         self.video_last_volume = volume
+        self.video_uses_external_window = not supports_x11_video_docking()
         self.stream_process = subprocess.Popen(
             self._streamlink_command(url, quality),
             stdout=subprocess.PIPE,
@@ -4410,7 +4568,7 @@ class TwitchAudioApp(ctk.CTk):
         parent_window_id = int(self.video_surface.winfo_id())
         dock_width = max(self.video_surface.winfo_width(), 1)
         dock_height = max(self.video_surface.winfo_height(), 1)
-        window_title = f"TwitchAudio FFplay {os.getpid()} {int(time.time() * 1000)}"
+        window_title = f"TwitchFreedom FFplay {os.getpid()} {int(time.time() * 1000)}"
         self.embedded_video_process = subprocess.Popen(
             self._embedded_ffplay_command(volume, window_title),
             stdin=self.stream_process.stdout,
@@ -4442,6 +4600,7 @@ class TwitchAudioApp(ctk.CTk):
         self.docked_video_window_id = None
         self.ffplay_video_fullscreen = False
         self.ffplay_dock_parent_id = None
+        self.video_uses_external_window = False
 
     def toggle_video_popout(self) -> None:
         if self.is_video_popped:
@@ -4496,15 +4655,15 @@ class TwitchAudioApp(ctk.CTk):
             self.video_stream_process.stdout.close()
         except Exception as exc:
             self.stop_video_popout(user_requested=False)
-            messagebox.showerror("Could not start FFplay Dock", str(exc))
-            self.log(f"FFplay Dock failed: {exc}")
+            messagebox.showerror("Could not start FFplay video", str(exc))
+            self.log(f"FFplay video failed: {exc}")
             return False
 
         self.history.save_launch(url, quality, volume, playback_mode=PLAYBACK_LOW_VIDEO)
         self.refresh_history(check_online=False)
         self.is_video_popped = True
         if self.pop_video_button is not None:
-            self.pop_video_button.configure(text="Stop FFplay Dock")
+            self.pop_video_button.configure(text="Stop FFplay Video")
         self.status_label.configure(text="Streaming", text_color="#72f2c7")
         self.now_playing_label.configure(text=f"{channel_name_from_url(url)} using {quality}")
         self.start_button.configure(state="disabled")
@@ -4524,6 +4683,7 @@ class TwitchAudioApp(ctk.CTk):
         self.docked_video_window_id = None
         self.ffplay_video_fullscreen = False
         self.ffplay_dock_parent_id = None
+        self.video_uses_external_window = False
         processes = [self.video_play_process, self.video_stream_process]
         for process in processes:
             if process and process.poll() is None:
@@ -4539,8 +4699,8 @@ class TwitchAudioApp(ctk.CTk):
         self.video_play_process = None
         self.is_video_popped = False
         if self.pop_video_button is not None:
-            self.pop_video_button.configure(text="Start FFplay Dock")
-        self.video_status_label.configure(text=VIDEO_READY_MESSAGE, text_color="#a7b0c8")
+            self.pop_video_button.configure(text="Start FFplay Video")
+        self.video_status_label.configure(text=video_ready_message(), text_color="#a7b0c8")
         self.set_stream_health("Idle" if user_requested else "Stopped")
         self.status_label.configure(text="Ready", text_color="#72f2c7")
         self.now_playing_label.configure(text="No active stream")
@@ -4585,9 +4745,10 @@ class TwitchAudioApp(ctk.CTk):
         self.stream_process = None
         self.play_process = None
         self.embedded_video_process = None
+        self.video_uses_external_window = False
         self.is_streaming = False
         self.exit_embedded_fullscreen()
-        self.video_status_label.configure(text=VIDEO_READY_MESSAGE, text_color="#a7b0c8")
+        self.video_status_label.configure(text=video_ready_message(), text_color="#a7b0c8")
         self.set_stream_health("Idle" if user_requested else "Stopped")
         self.status_label.configure(text="Ready", text_color="#72f2c7")
         self.now_playing_label.configure(text="No active stream")
@@ -4846,7 +5007,7 @@ def main() -> None:
     if history is None:
         return
 
-    app = TwitchAudioApp(history)
+    app = TwitchFreedomApp(history)
     app.mainloop()
 
 
