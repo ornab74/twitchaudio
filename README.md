@@ -10,21 +10,6 @@ The current implementation lives in `main.py`.
 > Note: the code may still contain legacy internal names such as `TwitchAudio` for app directories, window titles, or migration compatibility. This README uses the new product name: **Twitch Freedom**.
 <img width="1628" height="1144" alt="demotwitchfreedom" src="https://github.com/user-attachments/assets/a16824bf-c6bb-4c8b-a700-c10a0f51f8c3" />
 
-## What Changed
-
-- Renamed the project-facing documentation from **TwitchAudio** to **Twitch Freedom**.
-- Added the logo to the README with `logo.png`.
-- Updated the app description: Twitch Freedom is no longer audio-only.
-- Documented both playback modes:
-  - `Audio only`
-  - `Video`
-- Documented the built-in stream list / Explore flow, including direct play from Explore.
-- Documented live Twitch chat setup through a Twitch Developer application in Settings.
-- Documented cross-platform installer scripts, launchers, and desktop shortcuts.
-- Added Mermaid diagrams for architecture, playback, OAuth/chat setup, and encrypted storage.
-- Kept the local vault, encrypted stream history, OAuth tokens, and chat transcript behavior from the current implementation.
-- Updated dependency notes for `streamlink==8.3.0` and the required `nh3==0.3.5` security sanitizer.
-
 ## Feature Overview
 
 ```mermaid
