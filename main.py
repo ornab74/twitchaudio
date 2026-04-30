@@ -3981,7 +3981,21 @@ class TwitchFreedomApp(ctk.CTk):
             ).pack(anchor="w", padx=10, pady=(0, 10))
             return
 
-        for record in records:
+        indexed_records = list(enumerate(records))
+
+        def online_sort_key(item: tuple[int, StreamRecord]) -> tuple[int, int]:
+            index, record = item
+            channel = twitch_channel_from_url(record.url) or ""
+            status = self.online_statuses.get(channel.lower())
+            if status is True:
+                status_rank = 0
+            elif status is False:
+                status_rank = 2
+            else:
+                status_rank = 1
+            return status_rank, index
+
+        for _index, record in sorted(indexed_records, key=online_sort_key):
             channel = twitch_channel_from_url(record.url) or ""
             status = self.online_statuses.get(channel.lower())
             card = StreamCard(self.history_frame, record, self, compact=True, online_status=status)
